@@ -1,3 +1,12 @@
+ms-a2-fancontrol (0.4.0) trixie; urgency=medium
+
+  * New command "dump": read-only report of DMI data, CPU model, sensors,
+    EC RAM 0x00-0xff, fan curve values and fan speeds. Runs on any MS-A2
+    BIOS version and never writes to the EC, for adding support for
+    other firmware.
+
+ -- ProxForge <ms-a2-fancontrol@proxforge.invalid>  Wed, 11 Nov 2026 22:00:00 +0100
+
 ms-a2-fancontrol (0.3.1) trixie; urgency=medium
 
   * First public release under GPL-3.0-or-later; English documentation

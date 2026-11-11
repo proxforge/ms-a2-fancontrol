@@ -40,7 +40,7 @@ With the service, the NVMe controller stayed at 77 °C or below under the same l
 | Tested with | Ryzen 9 7945HX, 2× Micron 7450 NVMe, 2× 64 GB DDR5 SO-DIMM; five units |
 | OS | Proxmox VE 9 (Debian 13 "trixie"). Any Debian-based system with systemd, Python 3 and a recent kernel should work. |
 
-At startup the service compares the product name, the BIOS version and the fan curve values in the EC with known values. If anything differs, it exits without writing. Other CPU variants of the MS-A2 (e.g. Ryzen 9 9955HX) are untested. They work only if their firmware matches.
+At startup the service compares the product name, the BIOS version and the fan curve values in the EC with known values. If anything differs, it exits without writing. Other CPU variants of the MS-A2 (e.g. Ryzen 9 9955HX) are untested. They work only if their firmware matches. If yours doesn't, see [Other BIOS versions and CPU variants](#other-bios-versions-and-cpu-variants).
 
 ## Requirements
 
@@ -66,7 +66,7 @@ Install the package on every MS-A2 host, for example on each node of a Proxmox V
 Download `ms-a2-fancontrol_<version>_all.deb` from the [Releases](https://github.com/proxforge/ms-a2-fancontrol/releases) page and install it:
 
 ```bash
-apt install ./ms-a2-fancontrol_0.3.1_all.deb
+apt install ./ms-a2-fancontrol_0.4.0_all.deb
 ```
 
 ### From source
@@ -78,7 +78,7 @@ git clone https://github.com/proxforge/ms-a2-fancontrol.git
 cd ms-a2-fancontrol
 bash test/run-tests.sh
 ./build-deb.sh
-apt install ./ms-a2-fancontrol_0.3.1_all.deb
+apt install ./ms-a2-fancontrol_0.4.0_all.deb
 ```
 
 The package enables and starts the service immediately (`ms-a2-fancontrol.service`). It also starts automatically at every boot.
@@ -182,8 +182,8 @@ ms-a2-fancontrol restore
 | Message or symptom | Cause and fix |
 |---|---|
 | `PermissionError: [Errno 1] Operation not permitted: '/dev/port'` | Secure Boot is on (kernel lockdown). Disable Secure Boot in the BIOS. |
-| `unsupported system MS-A2 BIOS x.yz` | The BIOS version is not 1.02. The service only runs on firmware whose EC layout is known. Please open an issue with the output of the commands below. |
-| `unexpected EC profile byte at 0x2f` or `EC level 0x.. = .., expected ..` | The BIOS fan mode is not "Auto", or the firmware uses a different layout. Set the fan mode to "Auto". If the message persists, open an issue. |
+| `unsupported system MS-A2 BIOS x.yz` | The BIOS version is not 1.02. The service only runs on firmware whose EC layout is known. See [Other BIOS versions and CPU variants](#other-bios-versions-and-cpu-variants). |
+| `unexpected EC profile byte at 0x2f` or `EC level 0x.. = .., expected ..` | The BIOS fan mode is not "Auto", or the firmware uses a different layout. Set the fan mode to "Auto". If the message persists, open an issue with the output of `ms-a2-fancontrol dump`. |
 | `no NVMe or DIMM temperature found` and fans at full speed | A temperature sensor is missing. The service runs the fans at the emergency level until it can read temperatures again. Check `grep -h . /sys/class/hwmon/hwmon*/name` and load the missing module, e.g. `modprobe spd5118`. |
 | Fans loud for a few minutes after a crash | Expected: after a crash or `kill` the service restarts and slows down from full speed one level every 5 seconds. A regular restart or package update starts from the firmware levels. |
 | `EC timeout` | Another program is accessing the EC at the same time. Stop it, or stop this service while using it. |
@@ -191,10 +191,27 @@ ms-a2-fancontrol restore
 When opening an issue, include:
 
 ```bash
-cat /sys/class/dmi/id/{sys_vendor,product_name,bios_version}
-ms-a2-fancontrol version
+ms-a2-fancontrol dump
 journalctl -u ms-a2-fancontrol -n 50 --no-pager
 ```
+
+### Other BIOS versions and CPU variants
+
+The service only writes to firmware whose fan curve layout is known (BIOS 1.02). To add support for another BIOS version or CPU variant, the EC values of that firmware are needed. `ms-a2-fancontrol dump` collects them. It runs on any BIOS version of the MS-A2 and **only reads**: DMI data, CPU model, sensors, the EC RAM (`0x00–0xff`), the fan curve values and the fan speeds. It never writes to the EC.
+
+You don't need to install the package for this. Run it as root. Secure Boot must be off (see [Requirements](#requirements)), and the BIOS fan mode must be "Auto":
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/proxforge/ms-a2-fancontrol/main/ms-a2-fancontrol
+python3 ms-a2-fancontrol dump > ms-a2-dump.txt
+```
+
+If the package is installed, stop the service first (`systemctl stop ms-a2-fancontrol`), so the fan levels show the firmware values. Then [open an issue](https://github.com/proxforge/ms-a2-fancontrol/issues) with:
+
+- the file `ms-a2-dump.txt`,
+- whether you can test a build on that machine.
+
+Support is added only after someone has tested it on that firmware: the maintainers don't have every BIOS version or CPU variant.
 
 ## Measurements
 
@@ -231,7 +248,7 @@ Fan speeds are only readable through indirect access to EC memory (I2EC via Supe
 
 | File | Purpose |
 |---|---|
-| `ms-a2-fancontrol` | Service and commands `run`, `status`, `restore`, `stop-post`, `version` (Python 3, standard library only) |
+| `ms-a2-fancontrol` | Service and commands `run`, `status`, `restore`, `stop-post`, `dump`, `version` (Python 3, standard library only) |
 | `ms-a2-fancontrol.service` | systemd unit. `ExecStopPost` calls `stop-post`, which restores the firmware levels after a regular stop and sets the emergency level after a failure. |
 | `ms-a2-fancontrol.default` | Settings, installed as `/etc/default/ms-a2-fancontrol` |
 | `build-deb.sh`, `debian/` | Builds `ms-a2-fancontrol_<version>_all.deb` |
@@ -239,7 +256,7 @@ Fan speeds are only readable through indirect access to EC memory (I2EC via Supe
 
 The version is `VERSION` in `ms-a2-fancontrol` and must match the first entry of `debian/changelog`. CI runs the tests and builds the package on every push. Pushing a tag `v<version>` publishes a release with the `.deb` and `SHA256SUMS`.
 
-Support for another BIOS version needs that firmware's fan curve values. To get them, read the EC with fan mode "Auto" and compare the layout above.
+Support for another BIOS version needs that firmware's fan curve values. `ms-a2-fancontrol dump` prints the EC RAM and decodes it with the layout above. See [Other BIOS versions and CPU variants](#other-bios-versions-and-cpu-variants).
 
 ## License
 

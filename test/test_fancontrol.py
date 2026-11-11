@@ -1,7 +1,9 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Tests for ms-a2-fancontrol without hardware: hwmon and DMI as directories, EC as a fake."""
+import contextlib
 import importlib.machinery
+import io
 import importlib.util
 import os
 import sys
@@ -35,6 +37,9 @@ class FakeEC:
         self.writes.append((addr, value))
         if not self.reject_writes:
             self.ram[addr] = value
+
+    def tach_rpm(self):
+        return (1512, 3199)
 
     def sys_levels(self):
         return [self.ram[a] for a in fc.SYS_LEVEL_ADDRS]
@@ -188,13 +193,17 @@ class LockTest(unittest.TestCase):
         self.assertEqual(result, [0x2A])
 
 
+def make_dmi(product="MS-A2", bios="1.02"):
+    root = tempfile.mkdtemp()
+    for name, value in (("product_name", product), ("bios_version", bios)):
+        with open(os.path.join(root, name), "w") as fh:
+            fh.write(value + "\n")
+    return root
+
+
 class PlatformTest(unittest.TestCase):
     def dmi(self, product="MS-A2", bios="1.02"):
-        root = tempfile.mkdtemp()
-        for name, value in (("product_name", product), ("bios_version", bios)):
-            with open(os.path.join(root, name), "w") as fh:
-                fh.write(value + "\n")
-        return root
+        return make_dmi(product, bios)
 
     def test_ms_a2_is_accepted(self):
         fc.check_platform(FakeEC(), self.dmi())
@@ -212,6 +221,51 @@ class PlatformTest(unittest.TestCase):
         ec.ram[0x30] = 10
         with self.assertRaises(RuntimeError):
             fc.check_platform(ec, self.dmi())
+
+
+class DumpTest(unittest.TestCase):
+    def dump(self, ec, bios="1.03"):
+        dmi = make_dmi(bios=bios)
+        hwmon = tempfile.mkdtemp()
+        make_hwmon(hwmon, nvme=[58], nvme_s1=[74], dimm=[47], cpu=60)
+        cpuinfo = os.path.join(hwmon, "cpuinfo")
+        with open(cpuinfo, "w") as fh:
+            fh.write("processor\t: 0\nmodel name\t: AMD Ryzen 9 9955HX 16-Core Processor\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fc.dump(ec, dmi, hwmon, cpuinfo)
+        return out.getvalue()
+
+    def test_dump_on_other_bios_reads_only(self):
+        ec = FakeEC()
+        text = self.dump(ec)
+        self.assertEqual(ec.writes, [])
+        self.assertIn("bios_version         1.03", text)
+        self.assertIn("9955HX", text)
+        self.assertIn("nvme                 1", text)
+        self.assertIn("30:  1a 00 00 24 00 00 24", text)
+        self.assertIn("profile 0x2f        0xb1", text)
+        self.assertIn("system fan levels   [26, 36, 36]", text)
+        self.assertIn("cpu 1512 rpm, system 3199 rpm", text)
+
+    def test_dump_survives_ec_errors(self):
+        class FailingEC(FakeEC):
+            def read(self, addr):
+                if addr == 0x30:
+                    raise TimeoutError("EC timeout: obf")
+                return super().read(addr)
+
+            def tach_rpm(self):
+                return None
+
+        text = self.dump(FailingEC())
+        self.assertIn("30:  -- 00", text)
+        self.assertIn("not readable", text)
+
+    def test_dump_needs_ms_a2(self):
+        fc.check_product(make_dmi(bios="9.99"))
+        with self.assertRaises(RuntimeError):
+            fc.check_product(make_dmi(product="Other"))
 
 
 class RunTest(unittest.TestCase):

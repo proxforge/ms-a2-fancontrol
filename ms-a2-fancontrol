@@ -12,7 +12,10 @@ error: emergency level (full speed) until systemd restarts the service; ExecStop
 0x62/0x66 (RD_EC 0x80, WR_EC 0x81); fan speeds for display only through I2EC (Super I/O
 0x2E/0x2F). Requires Secure Boot to be disabled.
 
-Usage: ms-a2-fancontrol run | status | restore | stop-post | version
+"dump" only reads: DMI data, CPU model, sensors and the whole EC RAM, for adding support for
+other firmware. It runs on any MS-A2 BIOS version and never writes to the EC.
+
+Usage: ms-a2-fancontrol run | status | restore | stop-post | dump | version
 """
 import contextlib
 import os
@@ -20,7 +23,7 @@ import signal
 import sys
 import time
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 
 CONFIG_FILE = os.environ.get("MSA2_FAN_CONFIG", "/etc/default/ms-a2-fancontrol")
 HWMON_ROOT = os.environ.get("MSA2_FAN_HWMON", "/sys/class/hwmon")
@@ -279,12 +282,20 @@ def restore(ec):
 
 # --- Checks ------------------------------------------------------------------------------------
 
-def check_platform(ec, dmi_root=DMI_ROOT):
-    def dmi(name):
-        with open(os.path.join(dmi_root, name)) as fh:
-            return fh.read().strip()
+def read_dmi(name, dmi_root=DMI_ROOT):
+    with open(os.path.join(dmi_root, name)) as fh:
+        return fh.read().strip()
 
-    product, bios = dmi("product_name"), dmi("bios_version")
+
+def check_product(dmi_root=DMI_ROOT):
+    """Only the device, any BIOS version: enough for read-only EC access ("dump")."""
+    product = read_dmi("product_name", dmi_root)
+    if product not in SUPPORTED_PRODUCTS:
+        raise RuntimeError("unsupported system %s" % product)
+
+
+def check_platform(ec, dmi_root=DMI_ROOT):
+    product, bios = read_dmi("product_name", dmi_root), read_dmi("bios_version", dmi_root)
     if product not in SUPPORTED_PRODUCTS or bios not in SUPPORTED_BIOS:
         raise RuntimeError("unsupported system %s BIOS %s" % (product, bios))
     if ec.read(EC_PROFILE_ADDR) not in EC_PROFILES:
@@ -366,12 +377,97 @@ def status(ec):
         print("Fan speed         cpu %d rpm, system %d rpm" % rpm)
 
 
+DUMP_DMI = ("sys_vendor", "product_name", "board_name", "bios_vendor", "bios_version", "bios_date",
+            "bios_release", "ec_firmware_release")
+DUMP_HWMON = ("nvme", "spd5118", "k10temp")
+
+
+def dump(ec, dmi_root=DMI_ROOT, hwmon_root=HWMON_ROOT, cpuinfo="/proc/cpuinfo"):
+    """Read-only report for an issue: DMI, CPU, sensors, EC RAM 0x00-0xff, fan values. Never writes."""
+    print("ms-a2-fancontrol %s dump" % VERSION)
+    print("Stop the service first (systemctl stop ms-a2-fancontrol), BIOS fan mode must be Auto.")
+    print()
+    print("[DMI]")
+    for name in DUMP_DMI:
+        try:
+            value = read_dmi(name, dmi_root)
+        except OSError:
+            value = "-"
+        print("%-20s %s" % (name, value))
+    cpu = "-"
+    try:
+        with open(cpuinfo) as fh:
+            for line in fh:
+                if line.startswith("model name"):
+                    cpu = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    print("%-20s %s" % ("cpu", cpu))
+    print()
+    print("[Sensors]")
+    try:
+        names = []
+        for entry in sorted(os.listdir(hwmon_root)):
+            try:
+                with open(os.path.join(hwmon_root, entry, "name")) as fh:
+                    names.append(fh.read().strip())
+            except OSError:
+                continue
+        for name in DUMP_HWMON:
+            print("%-20s %d" % (name, names.count(name)))
+    except OSError as err:
+        print("hwmon not readable (%s)" % err)
+    try:
+        temps = read_temps(hwmon_root)
+        print("NVMe Composite %.0f C, Sensor 1 %.0f C, DIMM %.0f C, CPU %.0f C"
+              % (temps["nvme"], temps["nvme_s1"], temps["dimm"], temps["cpu"]))
+    except (OSError, ValueError) as err:
+        print("temperatures: %s" % err)
+    print()
+    print("[EC RAM]")
+    ram = []
+    for addr in range(256):
+        try:
+            ram.append(ec.read(addr))
+        except (OSError, TimeoutError):
+            ram.append(None)
+    print("     " + " ".join("%2x" % col for col in range(16)))
+    for row in range(0, 256, 16):
+        print("%02x:  " % row + " ".join("--" if v is None else "%02x" % v for v in ram[row:row + 16]))
+    print()
+    print("[Fan values, BIOS 1.02 layout]")
+
+    def at(addrs):
+        return [ram[a] for a in addrs]
+
+    print("profile 0x2f        %s (1.02: %s)" % ("--" if ram[EC_PROFILE_ADDR] is None else "0x%02x" % ram[EC_PROFILE_ADDR],
+                                                 "/".join("0x%02x" % p for p in EC_PROFILES)))
+    print("system fan levels   %s (1.02: %s)" % (at(SYS_LEVEL_ADDRS), list(SYS_LEVEL_DEFAULTS)))
+    print("cpu fan levels      %s (1.02: %s)" % (at(CPU_LEVEL_ADDRS), list(CPU_LEVEL_DEFAULTS)))
+    print("EC temperatures     cpu %s C, system %s C" % (ram[0x09], ram[0x05]))
+    try:
+        rpm = ec.tach_rpm()
+    except (OSError, TimeoutError) as err:
+        rpm, err_text = None, str(err)
+    else:
+        err_text = "chip ID is not IT5571"
+    if rpm:
+        print("fan speed           cpu %d rpm, system %d rpm" % rpm)
+    else:
+        print("fan speed           not readable (%s)" % err_text)
+
+
 def main(argv):
-    if len(argv) != 2 or argv[1] not in ("run", "status", "restore", "stop-post", "version"):
+    if len(argv) != 2 or argv[1] not in ("run", "status", "restore", "stop-post", "dump", "version"):
         print(__doc__.strip().splitlines()[-1], file=sys.stderr)
         return 2
     if argv[1] == "version":
         print(VERSION)
+        return 0
+    if argv[1] == "dump":
+        check_product()
+        dump(PortEC())
         return 0
     ec = PortEC()
     check_platform(ec)
