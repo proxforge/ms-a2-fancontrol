@@ -1,0 +1,38 @@
+ms-a2-fancontrol (0.3.1) trixie; urgency=medium
+
+  * First public release under GPL-3.0-or-later; English documentation
+    and comments. No functional change.
+
+ -- ProxForge <ms-a2-fancontrol@proxforge.invalid>  Wed, 11 Nov 2026 21:00:00 +0100
+
+ms-a2-fancontrol (0.3.0) trixie; urgency=medium
+
+  * Crash or error sets the emergency level instead of the firmware levels;
+    only a regular stop restores them (ExecStopPost "stop-post" reads
+    SERVICE_RESULT). After a restart the levels fall gradually from the
+    current EC values.
+
+ -- ProxForge <ms-a2-fancontrol@proxforge.invalid>  Wed, 11 Nov 2026 20:15:00 +0100
+
+ms-a2-fancontrol (0.2.0) trixie; urgency=medium
+
+  * Emergency level: both fans to full speed (level 60) at NVMe 70 C,
+    controller sensor 85 C, RAM 68 C, CPU 92 C or without temperatures.
+  * Serialize EC port access with a lock file, so "status" cannot
+    interleave with the running service.
+
+ -- ProxForge <ms-a2-fancontrol@proxforge.invalid>  Wed, 11 Nov 2026 19:45:00 +0100
+
+ms-a2-fancontrol (0.1.1) trixie; urgency=medium
+
+  * CPU fan by RAM temperature from 50 C, full level at 62 C (was 45/52 C);
+    the modules are specified up to 85 C.
+
+ -- ProxForge <ms-a2-fancontrol@proxforge.invalid>  Wed, 11 Nov 2026 19:50:00 +0100
+
+ms-a2-fancontrol (0.1.0) trixie; urgency=medium
+
+  * First version: system fan by NVMe temperature, CPU fan by RAM
+    temperature, never below the firmware levels, restore on stop.
+
+ -- ProxForge <ms-a2-fancontrol@proxforge.invalid>  Wed, 11 Nov 2026 19:30:00 +0100

@@ -1,0 +1,28 @@
+# Settings for ms-a2-fancontrol (temperatures in °C, levels in units of 100 rpm).
+# The firmware levels (system fan 26, CPU fan 16) are never undercut.
+# After a change: systemctl restart ms-a2-fancontrol
+
+# Poll every n seconds
+#INTERVAL=5
+
+# System fan by NVMe Composite: raise from NVME_LOW, full level at NVME_HIGH
+#NVME_LOW=50
+#NVME_HIGH=62
+# Controller sensor (Sensor 1) at or above this value: emergency level
+#NVME_SENSOR1_MAX=85
+#SYS_LEVEL_MAX=50
+
+# CPU fan by RAM (SPD sensor): raise from DIMM_LOW, full level at DIMM_HIGH
+#DIMM_LOW=50
+#DIMM_HIGH=62
+#CPU_LEVEL_MAX=40
+
+# Lower by at most this many levels per interval (raising is immediate)
+#FALL_STEP=1
+
+# Emergency level: at any of these temperatures (NVMe Composite, RAM, CPU Tctl) both fans go to
+# EMERGENCY_LEVEL, i.e. full speed; the same applies when no temperatures can be read
+#NVME_EMERGENCY=70
+#DIMM_EMERGENCY=68
+#CPU_EMERGENCY=92
+#EMERGENCY_LEVEL=60

@@ -1,0 +1,12 @@
+#!/bin/sh
+# postinst of ms-a2-fancontrol: enable and (re)start the service
+set -e
+
+case "$1" in
+    configure)
+        systemctl daemon-reload || true
+        systemctl enable ms-a2-fancontrol.service > /dev/null 2>&1 || true
+        systemctl restart ms-a2-fancontrol.service || echo "ms-a2-fancontrol: start failed, see journalctl -u ms-a2-fancontrol"
+        ;;
+esac
+exit 0

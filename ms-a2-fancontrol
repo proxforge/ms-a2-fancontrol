@@ -1,0 +1,390 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Demand-based fan control for the Minisforum MS-A2 (EC ITE IT5571) by NVMe and RAM temperature.
+
+The EC drives both fans to target speeds (level x 100 rpm) taken from fan curves in EC RAM.
+This service only raises the levels of those curves, never below the firmware values:
+  - system fan (cools the NVMe drives): levels at 0x30, 0x33, 0x36
+  - CPU fan (airflow across the RAM): levels at 0x13, 0x16, ..., 0x25
+Regular stop (systemctl stop, apt remove, shutdown): firmware values are restored. Crash or
+error: emergency level (full speed) until systemd restarts the service; ExecStopPost calls
+"stop-post", which evaluates SERVICE_RESULT from systemd. Access through the ACPI EC ports
+0x62/0x66 (RD_EC 0x80, WR_EC 0x81); fan speeds for display only through I2EC (Super I/O
+0x2E/0x2F). Requires Secure Boot to be disabled.
+
+Usage: ms-a2-fancontrol run | status | restore | stop-post | version
+"""
+import contextlib
+import os
+import signal
+import sys
+import time
+
+VERSION = "0.3.1"
+
+CONFIG_FILE = os.environ.get("MSA2_FAN_CONFIG", "/etc/default/ms-a2-fancontrol")
+HWMON_ROOT = os.environ.get("MSA2_FAN_HWMON", "/sys/class/hwmon")
+DMI_ROOT = os.environ.get("MSA2_FAN_DMI", "/sys/class/dmi/id")
+# The service and "status" share the EC ports; without a lock their command sequences interleave
+LOCK_FILE = os.environ.get("MSA2_FAN_LOCK", "/run/ms-a2-fancontrol.lock")
+
+# Firmware levels (BIOS 1.02, fan mode Auto), read from five MS-A2 units
+SYS_LEVEL_ADDRS = (0x30, 0x33, 0x36)
+SYS_LEVEL_DEFAULTS = (26, 36, 36)
+CPU_LEVEL_ADDRS = (0x13, 0x16, 0x19, 0x1C, 0x1F, 0x22, 0x25)
+CPU_LEVEL_DEFAULTS = (16, 16, 22, 26, 30, 33, 35)
+EC_PROFILE_ADDR = 0x2F
+EC_PROFILES = (0xB1, 0xB2)
+SUPPORTED_PRODUCTS = ("MS-A2",)
+SUPPORTED_BIOS = ("1.02",)
+
+DEFAULTS = {
+    "INTERVAL": 5,
+    # System fan by NVMe Composite: raise from NVME_LOW, full level at NVME_HIGH
+    "NVME_LOW": 50,
+    "NVME_HIGH": 62,
+    # Controller sensor (Sensor 1) at or above this value: emergency level
+    "NVME_SENSOR1_MAX": 85,
+    # CPU fan by RAM (SPD sensor): raise from DIMM_LOW, full level at DIMM_HIGH
+    "DIMM_LOW": 50,
+    "DIMM_HIGH": 62,
+    "SYS_LEVEL_MAX": 50,
+    "CPU_LEVEL_MAX": 40,
+    # Lower by at most this many levels per interval (raising is immediate)
+    "FALL_STEP": 1,
+    # Emergency: at any of these temperatures both fans go to EMERGENCY_LEVEL (full PWM)
+    "NVME_EMERGENCY": 70,
+    "DIMM_EMERGENCY": 68,
+    "CPU_EMERGENCY": 92,
+    "EMERGENCY_LEVEL": 60,
+}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def load_config(path=CONFIG_FILE):
+    cfg = dict(DEFAULTS)
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if not line or "=" not in line:
+                    continue
+                key, value = (part.strip() for part in line.split("=", 1))
+                if key in cfg:
+                    cfg[key] = int(value.strip('"'))
+    except FileNotFoundError:
+        pass
+    if not (cfg["NVME_LOW"] < cfg["NVME_HIGH"] and cfg["DIMM_LOW"] < cfg["DIMM_HIGH"]):
+        raise ValueError("LOW must be below HIGH")
+    if cfg["SYS_LEVEL_MAX"] < max(SYS_LEVEL_DEFAULTS) or cfg["CPU_LEVEL_MAX"] < max(CPU_LEVEL_DEFAULTS):
+        raise ValueError("LEVEL_MAX below firmware levels")
+    if cfg["SYS_LEVEL_MAX"] > 60 or cfg["CPU_LEVEL_MAX"] > 60:
+        raise ValueError("LEVEL_MAX above 60")
+    if not max(cfg["SYS_LEVEL_MAX"], cfg["CPU_LEVEL_MAX"]) <= cfg["EMERGENCY_LEVEL"] <= 60:
+        raise ValueError("EMERGENCY_LEVEL must be between LEVEL_MAX and 60")
+    if not (cfg["NVME_HIGH"] < cfg["NVME_EMERGENCY"] and cfg["DIMM_HIGH"] < cfg["DIMM_EMERGENCY"]):
+        raise ValueError("EMERGENCY must be above HIGH")
+    return cfg
+
+
+# --- Temperatures ------------------------------------------------------------------------------
+
+def _read_milli(path):
+    with open(path) as fh:
+        return int(fh.read().strip()) / 1000.0
+
+
+def read_temps(root=HWMON_ROOT):
+    """NVMe Composite and Sensor 1, SPD sensors of the DIMMs and CPU (Tctl); raises OSError without values."""
+    nvme, nvme_s1, dimm, cpu = [], [], [], []
+    for entry in sorted(os.listdir(root)):
+        base = os.path.join(root, entry)
+        try:
+            with open(os.path.join(base, "name")) as fh:
+                name = fh.read().strip()
+        except OSError:
+            continue
+        if name == "nvme":
+            nvme.append(_read_milli(os.path.join(base, "temp1_input")))
+            s1 = os.path.join(base, "temp2_input")
+            if os.path.exists(s1):
+                nvme_s1.append(_read_milli(s1))
+        elif name == "spd5118":
+            dimm.append(_read_milli(os.path.join(base, "temp1_input")))
+        elif name == "k10temp":
+            cpu.append(_read_milli(os.path.join(base, "temp1_input")))
+    if not nvme or not dimm:
+        raise OSError("no NVMe or DIMM temperature found")
+    # Without k10temp the EC still controls the CPU fan itself; the emergency level then only uses NVMe and RAM
+    return {"nvme": max(nvme), "nvme_s1": max(nvme_s1) if nvme_s1 else 0.0, "dimm": max(dimm),
+            "cpu": max(cpu) if cpu else 0.0}
+
+
+# --- Control -----------------------------------------------------------------------------------
+
+def ramp(value, low, high, level_min, level_max):
+    """Linear from level_min (at low) to level_max (at high)."""
+    if value <= low:
+        return level_min
+    if value >= high:
+        return level_max
+    return round(level_min + (value - low) * (level_max - level_min) / (high - low))
+
+
+def emergency(temps, cfg):
+    """Emergency level: no temperatures or any emergency threshold reached."""
+    if temps is None:
+        return True
+    return (temps["nvme"] >= cfg["NVME_EMERGENCY"] or temps["nvme_s1"] >= cfg["NVME_SENSOR1_MAX"]
+            or temps["dimm"] >= cfg["DIMM_EMERGENCY"] or temps["cpu"] >= cfg["CPU_EMERGENCY"])
+
+
+def demand(temps, cfg):
+    """Requested minimum level for the system fan and the CPU fan."""
+    if emergency(temps, cfg):
+        return cfg["EMERGENCY_LEVEL"], cfg["EMERGENCY_LEVEL"]
+    sys_level = ramp(temps["nvme"], cfg["NVME_LOW"], cfg["NVME_HIGH"], SYS_LEVEL_DEFAULTS[0], cfg["SYS_LEVEL_MAX"])
+    cpu_level = ramp(temps["dimm"], cfg["DIMM_LOW"], cfg["DIMM_HIGH"], CPU_LEVEL_DEFAULTS[0], cfg["CPU_LEVEL_MAX"])
+    return sys_level, cpu_level
+
+
+def smooth(previous, wanted, fall_step):
+    """Raise immediately, lower slowly."""
+    if previous is None or wanted >= previous:
+        return wanted
+    return max(wanted, previous - fall_step)
+
+
+def curve(floor, defaults):
+    """Curve levels: firmware value, but at least floor."""
+    return tuple(max(d, floor) for d in defaults)
+
+
+# --- EC access ---------------------------------------------------------------------------------
+
+class PortEC:
+    """ACPI EC interface through /dev/port; every access holds an exclusive file lock."""
+    DATA, CMD, OBF, IBF = 0x62, 0x66, 0x01, 0x02
+
+    def __init__(self, path="/dev/port", lock_path=LOCK_FILE):
+        self.fd = os.open(path, os.O_RDWR)
+        self.lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+
+    @contextlib.contextmanager
+    def _locked(self):
+        import fcntl  # Linux only; the hardware-free tests also run on Windows
+
+        fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+
+    def _inb(self, port):
+        os.lseek(self.fd, port, 0)
+        return os.read(self.fd, 1)[0]
+
+    def _outb(self, port, value):
+        os.lseek(self.fd, port, 0)
+        os.write(self.fd, bytes([value]))
+
+    def _wait(self, ready, what):
+        start = time.monotonic()
+        while not ready(self._inb(self.CMD)):
+            if time.monotonic() - start > 0.1:
+                raise TimeoutError("EC timeout: " + what)
+            time.sleep(0.0002)
+
+    def _flush(self):
+        if self._inb(self.CMD) & self.OBF:
+            self._inb(self.DATA)
+
+    def read(self, addr):
+        with self._locked():
+            return self._read(addr)
+
+    def write(self, addr, value):
+        with self._locked():
+            self._write(addr, value)
+
+    def _read(self, addr):
+        self._flush()
+        self._wait(lambda s: not s & self.IBF, "ibf")
+        self._outb(self.CMD, 0x80)
+        self._wait(lambda s: not s & self.IBF, "ibf")
+        self._outb(self.DATA, addr)
+        self._wait(lambda s: s & self.OBF, "obf")
+        return self._inb(self.DATA)
+
+    def _write(self, addr, value):
+        self._flush()
+        self._wait(lambda s: not s & self.IBF, "ibf")
+        self._outb(self.CMD, 0x81)
+        self._wait(lambda s: not s & self.IBF, "ibf")
+        self._outb(self.DATA, addr)
+        self._wait(lambda s: not s & self.IBF, "ibf")
+        self._outb(self.DATA, value)
+        self._wait(lambda s: not s & self.IBF, "ibf")
+
+    def tach_rpm(self):
+        """Speed of the CPU and system fan through I2EC (tachometers F1/F2 of the IT5571)."""
+        def sio(reg, value=None):
+            self._outb(0x2E, reg)
+            if value is None:
+                return self._inb(0x2F)
+            self._outb(0x2F, value)
+            return None
+
+        def i2ec(addr):
+            sio(0x2E, 0x11), sio(0x2F, addr >> 8)
+            sio(0x2E, 0x10), sio(0x2F, addr & 0xFF)
+            sio(0x2E, 0x12)
+            return sio(0x2F)
+
+        with self._locked():
+            if (i2ec(0x2000), i2ec(0x2001)) != (0x55, 0x71):
+                return None
+            rpm = []
+            for lo, hi in ((0x181E, 0x181F), (0x1820, 0x1821)):
+                count = i2ec(hi) << 8 | i2ec(lo)
+                rpm.append(round(2156220 / count) if count else 0)
+            return tuple(rpm)
+
+
+def write_checked(ec, addr, value):
+    if ec.read(addr) == value:
+        return False
+    ec.write(addr, value)
+    got = ec.read(addr)
+    if got != value:
+        raise IOError("EC 0x%02x: wrote %d, read %d" % (addr, value, got))
+    return True
+
+
+def apply_levels(ec, sys_floor, cpu_floor):
+    changed = False
+    for addr, value in zip(SYS_LEVEL_ADDRS, curve(sys_floor, SYS_LEVEL_DEFAULTS)):
+        changed |= write_checked(ec, addr, value)
+    for addr, value in zip(CPU_LEVEL_ADDRS, curve(cpu_floor, CPU_LEVEL_DEFAULTS)):
+        changed |= write_checked(ec, addr, value)
+    return changed
+
+
+def restore(ec):
+    apply_levels(ec, 0, 0)
+
+
+# --- Checks ------------------------------------------------------------------------------------
+
+def check_platform(ec, dmi_root=DMI_ROOT):
+    def dmi(name):
+        with open(os.path.join(dmi_root, name)) as fh:
+            return fh.read().strip()
+
+    product, bios = dmi("product_name"), dmi("bios_version")
+    if product not in SUPPORTED_PRODUCTS or bios not in SUPPORTED_BIOS:
+        raise RuntimeError("unsupported system %s BIOS %s" % (product, bios))
+    if ec.read(EC_PROFILE_ADDR) not in EC_PROFILES:
+        raise RuntimeError("unexpected EC profile byte at 0x2f")
+    for addr, default in zip(SYS_LEVEL_ADDRS + CPU_LEVEL_ADDRS, SYS_LEVEL_DEFAULTS + CPU_LEVEL_DEFAULTS):
+        value = ec.read(addr)
+        # Above firmware is allowed (left over from an earlier run), below or implausible is not
+        if not default <= value <= 60:
+            raise RuntimeError("EC level 0x%02x = %d, expected %d..60" % (addr, value, default))
+
+
+# --- Commands ----------------------------------------------------------------------------------
+
+def run(ec, cfg, sleep=time.sleep, cycles=None):
+    stop = {"flag": False}
+
+    def on_signal(_signum, _frame):
+        stop["flag"] = True
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    # Start from the levels in the EC: after a crash (emergency level) lower slowly instead of jumping
+    sys_level, cpu_level = ec.read(SYS_LEVEL_ADDRS[0]), ec.read(CPU_LEVEL_ADDRS[0])
+    log("ms-a2-fancontrol %s: start" % VERSION)
+    try:
+        n = 0
+        while not stop["flag"] and (cycles is None or n < cycles):
+            n += 1
+            try:
+                temps = read_temps()
+            except (OSError, ValueError) as err:
+                log("temperature read failed (%s): emergency fan levels" % err)
+                temps = None
+            want_sys, want_cpu = demand(temps, cfg)
+            new_sys = smooth(sys_level, want_sys, cfg["FALL_STEP"])
+            new_cpu = smooth(cpu_level, want_cpu, cfg["FALL_STEP"])
+            if apply_levels(ec, new_sys, new_cpu) or (new_sys, new_cpu) != (sys_level, cpu_level):
+                if temps:
+                    log("nvme %.0f/%.0f C dimm %.0f C cpu %.0f C -> system fan level %d, cpu fan floor %d%s"
+                        % (temps["nvme"], temps["nvme_s1"], temps["dimm"], temps["cpu"], new_sys, new_cpu,
+                           " (emergency)" if emergency(temps, cfg) else ""))
+            sys_level, cpu_level = new_sys, new_cpu
+            sleep(cfg["INTERVAL"])
+    except BaseException:
+        set_emergency(ec, cfg)
+        raise
+    restore(ec)
+    log("ms-a2-fancontrol: firmware fan levels restored")
+
+
+def set_emergency(ec, cfg):
+    """Both fans to the emergency level; errors are only logged, the caller ends anyway."""
+    try:
+        apply_levels(ec, cfg["EMERGENCY_LEVEL"], cfg["EMERGENCY_LEVEL"])
+        log("ms-a2-fancontrol: emergency fan levels set")
+    except (OSError, TimeoutError) as err:
+        log("ms-a2-fancontrol: setting emergency fan levels failed (%s)" % err)
+
+
+def stop_post(ec, cfg, service_result):
+    """After the service ended: firmware values only after a regular stop, otherwise emergency level."""
+    if service_result == "success":
+        restore(ec)
+        log("ms-a2-fancontrol: service stopped, firmware fan levels restored")
+        return
+    log("ms-a2-fancontrol: service ended with %s" % (service_result or "unknown result"))
+    set_emergency(ec, cfg)
+
+
+def status(ec):
+    temps = read_temps()
+    rpm = ec.tach_rpm()
+    print("NVMe Composite %.0f C, Sensor 1 %.0f C, DIMM %.0f C, CPU %.0f C"
+          % (temps["nvme"], temps["nvme_s1"], temps["dimm"], temps["cpu"]))
+    print("System fan levels %s (firmware %s)" % ([ec.read(a) for a in SYS_LEVEL_ADDRS], list(SYS_LEVEL_DEFAULTS)))
+    print("CPU fan levels    %s (firmware %s)" % ([ec.read(a) for a in CPU_LEVEL_ADDRS], list(CPU_LEVEL_DEFAULTS)))
+    print("EC temperatures   cpu %d C, system %d C" % (ec.read(0x09), ec.read(0x05)))
+    if rpm:
+        print("Fan speed         cpu %d rpm, system %d rpm" % rpm)
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] not in ("run", "status", "restore", "stop-post", "version"):
+        print(__doc__.strip().splitlines()[-1], file=sys.stderr)
+        return 2
+    if argv[1] == "version":
+        print(VERSION)
+        return 0
+    ec = PortEC()
+    check_platform(ec)
+    if argv[1] == "status":
+        status(ec)
+    elif argv[1] == "restore":
+        restore(ec)
+    elif argv[1] == "stop-post":
+        stop_post(ec, load_config(), os.environ.get("SERVICE_RESULT", ""))
+    else:
+        run(ec, load_config())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

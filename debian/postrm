@@ -1,0 +1,10 @@
+#!/bin/sh
+# postrm of ms-a2-fancontrol
+set -e
+
+case "$1" in
+    remove|purge)
+        systemctl daemon-reload || true
+        ;;
+esac
+exit 0

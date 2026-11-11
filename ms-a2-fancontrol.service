@@ -1,0 +1,15 @@
+[Unit]
+Description=Fan control for Minisforum MS-A2 by NVMe and RAM temperature
+Documentation=https://github.com/proxforge/ms-a2-fancontrol
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ms-a2-fancontrol run
+# Regular stop: firmware levels; crash or error: emergency level until the restart
+ExecStopPost=-/usr/sbin/ms-a2-fancontrol stop-post
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

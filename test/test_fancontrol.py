@@ -1,0 +1,305 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Tests for ms-a2-fancontrol without hardware: hwmon and DMI as directories, EC as a fake."""
+import importlib.machinery
+import importlib.util
+import os
+import sys
+import tempfile
+import threading
+import time
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+_loader = importlib.machinery.SourceFileLoader("fancontrol", os.path.join(HERE, "..", "ms-a2-fancontrol"))
+_spec = importlib.util.spec_from_loader("fancontrol", _loader)
+fc = importlib.util.module_from_spec(_spec)
+_loader.exec_module(fc)
+
+
+class FakeEC:
+    """EC RAM with the firmware values of BIOS 1.02."""
+
+    def __init__(self, reject_writes=False):
+        self.ram = [0] * 256
+        self.ram[0x2F] = 0xB1
+        for addr, value in zip(fc.SYS_LEVEL_ADDRS + fc.CPU_LEVEL_ADDRS, fc.SYS_LEVEL_DEFAULTS + fc.CPU_LEVEL_DEFAULTS):
+            self.ram[addr] = value
+        self.writes = []
+        self.reject_writes = reject_writes
+
+    def read(self, addr):
+        return self.ram[addr]
+
+    def write(self, addr, value):
+        self.writes.append((addr, value))
+        if not self.reject_writes:
+            self.ram[addr] = value
+
+    def sys_levels(self):
+        return [self.ram[a] for a in fc.SYS_LEVEL_ADDRS]
+
+    def cpu_levels(self):
+        return [self.ram[a] for a in fc.CPU_LEVEL_ADDRS]
+
+
+def make_hwmon(root, nvme, nvme_s1, dimm, cpu=None):
+    for i, (comp, s1) in enumerate(zip(nvme, nvme_s1)):
+        base = os.path.join(root, "hwmon%d" % i)
+        os.makedirs(base)
+        with open(os.path.join(base, "name"), "w") as fh:
+            fh.write("nvme\n")
+        with open(os.path.join(base, "temp1_input"), "w") as fh:
+            fh.write("%d\n" % (comp * 1000))
+        with open(os.path.join(base, "temp2_input"), "w") as fh:
+            fh.write("%d\n" % (s1 * 1000))
+    for j, temp in enumerate(dimm):
+        base = os.path.join(root, "hwmon%d" % (10 + j))
+        os.makedirs(base)
+        with open(os.path.join(base, "name"), "w") as fh:
+            fh.write("spd5118\n")
+        with open(os.path.join(base, "temp1_input"), "w") as fh:
+            fh.write("%d\n" % (temp * 1000))
+    if cpu is not None:
+        base = os.path.join(root, "hwmon20")
+        os.makedirs(base)
+        with open(os.path.join(base, "name"), "w") as fh:
+            fh.write("k10temp\n")
+        with open(os.path.join(base, "temp1_input"), "w") as fh:
+            fh.write("%d\n" % (cpu * 1000))
+
+
+class ControlTest(unittest.TestCase):
+    cfg = dict(fc.DEFAULTS)
+
+    def test_cool_stays_at_firmware(self):
+        self.assertEqual(fc.demand({"nvme": 45, "nvme_s1": 60, "dimm": 40, "cpu": 60}, self.cfg), (26, 16))
+
+    def test_warm_nvme_raises_system_fan_linearly(self):
+        sys_level, cpu_level = fc.demand({"nvme": 56, "nvme_s1": 70, "dimm": 40, "cpu": 60}, self.cfg)
+        self.assertEqual(sys_level, 38)
+        self.assertEqual(cpu_level, 16)
+
+    def test_hot_nvme_full_level(self):
+        self.assertEqual(fc.demand({"nvme": 65, "nvme_s1": 78, "dimm": 40, "cpu": 60}, self.cfg), (50, 16))
+
+    def test_controller_sensor_forces_emergency(self):
+        self.assertEqual(fc.demand({"nvme": 51, "nvme_s1": 85, "dimm": 40, "cpu": 60}, self.cfg), (60, 60))
+
+    def test_emergency_per_sensor(self):
+        base = {"nvme": 45, "nvme_s1": 60, "dimm": 40, "cpu": 60}
+        for key, value in (("nvme", 70), ("dimm", 68), ("cpu", 92)):
+            temps = dict(base, **{key: value})
+            self.assertEqual(fc.demand(temps, self.cfg), (60, 60), key)
+        self.assertEqual(fc.demand(dict(base, dimm=67), self.cfg), (26, 40))
+
+    def test_warm_ram_raises_cpu_fan(self):
+        self.assertEqual(fc.demand({"nvme": 45, "nvme_s1": 60, "dimm": 62, "cpu": 60}, self.cfg), (26, 40))
+
+    def test_no_temperatures_emergency(self):
+        self.assertEqual(fc.demand(None, self.cfg), (60, 60))
+
+    def test_lower_slowly_raise_immediately(self):
+        self.assertEqual(fc.smooth(40, 26, 1), 39)
+        self.assertEqual(fc.smooth(30, 45, 1), 45)
+        self.assertEqual(fc.smooth(None, 26, 1), 26)
+
+    def test_curve_never_below_firmware(self):
+        self.assertEqual(fc.curve(30, fc.SYS_LEVEL_DEFAULTS), (30, 36, 36))
+        self.assertEqual(fc.curve(0, fc.CPU_LEVEL_DEFAULTS), fc.CPU_LEVEL_DEFAULTS)
+
+
+class EcTest(unittest.TestCase):
+    def test_apply_and_restore(self):
+        ec = FakeEC()
+        self.assertTrue(fc.apply_levels(ec, 45, 30))
+        self.assertEqual(ec.sys_levels(), [45, 45, 45])
+        self.assertEqual(ec.cpu_levels(), [30, 30, 30, 30, 30, 33, 35])
+        fc.restore(ec)
+        self.assertEqual(ec.sys_levels(), list(fc.SYS_LEVEL_DEFAULTS))
+        self.assertEqual(ec.cpu_levels(), list(fc.CPU_LEVEL_DEFAULTS))
+
+    def test_unchanged_writes_nothing(self):
+        ec = FakeEC()
+        self.assertFalse(fc.apply_levels(ec, 26, 16))
+        self.assertEqual(ec.writes, [])
+
+    def test_write_error_is_reported(self):
+        with self.assertRaises(IOError):
+            fc.apply_levels(FakeEC(reject_writes=True), 40, 16)
+
+
+class StopPostTest(unittest.TestCase):
+    """ExecStopPost: SERVICE_RESULT from systemd decides between firmware values and emergency level."""
+
+    def test_regular_stop_restores_firmware(self):
+        ec = FakeEC()
+        fc.apply_levels(ec, 45, 30)
+        fc.stop_post(ec, dict(fc.DEFAULTS), "success")
+        self.assertEqual(ec.sys_levels(), list(fc.SYS_LEVEL_DEFAULTS))
+        self.assertEqual(ec.cpu_levels(), list(fc.CPU_LEVEL_DEFAULTS))
+
+    def test_crash_sets_emergency(self):
+        for result in ("signal", "exit-code", "core-dump", "timeout", ""):
+            ec = FakeEC()
+            fc.stop_post(ec, dict(fc.DEFAULTS), result)
+            self.assertEqual(ec.sys_levels(), [60, 60, 60], result)
+            self.assertEqual(ec.cpu_levels(), [60] * 7, result)
+
+    def test_emergency_write_error_raises_nothing(self):
+        fc.stop_post(FakeEC(reject_writes=True), dict(fc.DEFAULTS), "signal")
+
+
+@unittest.skipIf(sys.platform == "win32", "flock is Linux only")
+class LockTest(unittest.TestCase):
+    """PortEC against a file as /dev/port: status 0x66 = OBF set, IBF clear; data 0x62 = 0x2a.
+    Port writes are discarded, otherwise the command would overwrite the status byte in the file."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.port = os.path.join(self.dir, "port")
+        data = bytearray(0x100)
+        data[0x66], data[0x62] = 0x01, 0x2A
+        with open(self.port, "wb") as fh:
+            fh.write(data)
+        self.lock = os.path.join(self.dir, "lock")
+
+    def port_ec(self):
+        ec = fc.PortEC(self.port, self.lock)
+        ec._outb = lambda _port, _value: None
+        return ec
+
+    def test_read_without_foreign_lock(self):
+        self.assertEqual(self.port_ec().read(0x30), 0x2A)
+
+    def test_read_waits_for_foreign_lock(self):
+        import fcntl
+
+        holder = os.open(self.lock, os.O_RDWR | os.O_CREAT)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        result = []
+        ec = self.port_ec()
+        reader = threading.Thread(target=lambda: result.append(ec.read(0x30)))
+        reader.start()
+        time.sleep(0.2)
+        self.assertEqual(result, [])
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        reader.join(2)
+        self.assertEqual(result, [0x2A])
+
+
+class PlatformTest(unittest.TestCase):
+    def dmi(self, product="MS-A2", bios="1.02"):
+        root = tempfile.mkdtemp()
+        for name, value in (("product_name", product), ("bios_version", bios)):
+            with open(os.path.join(root, name), "w") as fh:
+                fh.write(value + "\n")
+        return root
+
+    def test_ms_a2_is_accepted(self):
+        fc.check_platform(FakeEC(), self.dmi())
+
+    def test_other_device_is_rejected(self):
+        with self.assertRaises(RuntimeError):
+            fc.check_platform(FakeEC(), self.dmi(product="Other"))
+
+    def test_other_bios_is_rejected(self):
+        with self.assertRaises(RuntimeError):
+            fc.check_platform(FakeEC(), self.dmi(bios="1.03"))
+
+    def test_unexpected_ec_values_are_rejected(self):
+        ec = FakeEC()
+        ec.ram[0x30] = 10
+        with self.assertRaises(RuntimeError):
+            fc.check_platform(ec, self.dmi())
+
+
+class RunTest(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self._old_root = fc.HWMON_ROOT
+
+    def tearDown(self):
+        fc.HWMON_ROOT = self._old_root
+
+    def run_cycles(self, ec, cycles):
+        # read_temps uses the parameter default; redirect it to the test directory
+        original = fc.read_temps
+        fc.read_temps = lambda: original(self.root)
+        try:
+            fc.run(ec, dict(fc.DEFAULTS), sleep=lambda _s: None, cycles=cycles)
+        finally:
+            fc.read_temps = original
+
+    def test_controls_and_restores_at_the_end(self):
+        make_hwmon(self.root, nvme=[58, 61], nvme_s1=[74, 77], dimm=[47, 46])
+        ec = FakeEC()
+        self.run_cycles(ec, 2)
+        first_sys_write = next(value for addr, value in ec.writes if addr == 0x30)
+        self.assertGreater(first_sys_write, 26)
+        self.assertEqual(ec.sys_levels(), list(fc.SYS_LEVEL_DEFAULTS))
+        self.assertEqual(ec.cpu_levels(), list(fc.CPU_LEVEL_DEFAULTS))
+
+    def test_missing_sensors_emergency(self):
+        ec = FakeEC()
+        self.run_cycles(ec, 1)
+        self.assertIn((0x30, 60), ec.writes)
+        self.assertIn((0x13, 60), ec.writes)
+
+    def test_hot_cpu_emergency(self):
+        make_hwmon(self.root, nvme=[50, 50], nvme_s1=[65, 65], dimm=[45, 45], cpu=93)
+        ec = FakeEC()
+        self.run_cycles(ec, 1)
+        self.assertIn((0x30, 60), ec.writes)
+        self.assertIn((0x25, 60), ec.writes)
+
+    def test_error_in_loop_sets_emergency(self):
+        make_hwmon(self.root, nvme=[50, 50], nvme_s1=[65, 65], dimm=[45, 45])
+        ec = FakeEC()
+        original = fc.demand
+        fc.demand = lambda _temps, _cfg: (_ for _ in ()).throw(RuntimeError("test error"))
+        try:
+            with self.assertRaises(RuntimeError):
+                self.run_cycles(ec, 1)
+        finally:
+            fc.demand = original
+        self.assertEqual(ec.sys_levels(), [60, 60, 60])
+        self.assertEqual(ec.cpu_levels(), [60] * 7)
+
+    def test_restart_after_emergency_lowers_slowly(self):
+        make_hwmon(self.root, nvme=[45, 45], nvme_s1=[60, 60], dimm=[40, 40])
+        ec = FakeEC()
+        fc.apply_levels(ec, 60, 60)
+        ec.writes.clear()
+        self.run_cycles(ec, 2)
+        sys_writes = [value for addr, value in ec.writes if addr == 0x30]
+        self.assertEqual(sys_writes[:2], [59, 58])
+
+    def test_without_k10temp_cpu_zero(self):
+        make_hwmon(self.root, nvme=[50, 50], nvme_s1=[65, 65], dimm=[45, 45])
+        self.assertEqual(fc.read_temps(self.root)["cpu"], 0.0)
+
+
+class ConfigTest(unittest.TestCase):
+    def write(self, text):
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        return path
+
+    def test_values_from_file(self):
+        cfg = fc.load_config(self.write('NVME_LOW=48\nNVME_HIGH="60"  # comment\nUNKNOWN=1\n'))
+        self.assertEqual((cfg["NVME_LOW"], cfg["NVME_HIGH"]), (48, 60))
+
+    def test_missing_file_gives_defaults(self):
+        self.assertEqual(fc.load_config("/nonexistent/ms-a2-fancontrol"), fc.DEFAULTS)
+
+    def test_implausible_values_are_rejected(self):
+        for text in ("NVME_LOW=70\n", "SYS_LEVEL_MAX=20\n", "CPU_LEVEL_MAX=99\n", "EMERGENCY_LEVEL=45\n",
+                     "EMERGENCY_LEVEL=70\n", "DIMM_EMERGENCY=60\n"):
+            with self.assertRaises(ValueError):
+                fc.load_config(self.write(text))
+
+
+if __name__ == "__main__":
+    unittest.main()

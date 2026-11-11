@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tests
+        run: bash test/run-tests.sh
+
+      - name: Shell syntax
+        run: bash -n build-deb.sh && sh -n debian/postinst && sh -n debian/prerm && sh -n debian/postrm
+
+      - name: Tag matches version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(./ms-a2-fancontrol version)
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match VERSION $version"; exit 1; }
+
+      - name: Build package
+        run: mkdir -p dist && ./build-deb.sh dist && dpkg-deb --info dist/*.deb && dpkg-deb --contents dist/*.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ms-a2-fancontrol-deb
+          path: dist/*.deb
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ms-a2-fancontrol-deb
+          path: dist
+
+      - name: Create release with the package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum *.deb > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --notes "Debian package for Proxmox VE 9 / Debian 13 on the Minisforum MS-A2. See README for installation." \
+            *.deb SHA256SUMS

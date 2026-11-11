@@ -1,0 +1,15 @@
+#!/bin/sh
+# prerm of ms-a2-fancontrol: stop the service; ExecStopPost writes back the firmware levels
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        systemctl stop ms-a2-fancontrol.service || true
+        ;;
+esac
+case "$1" in
+    remove)
+        systemctl disable ms-a2-fancontrol.service > /dev/null 2>&1 || true
+        ;;
+esac
+exit 0

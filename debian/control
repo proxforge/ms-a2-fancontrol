@@ -1,0 +1,14 @@
+Package: ms-a2-fancontrol
+Version: @VERSION@
+Architecture: all
+Maintainer: ProxForge <ms-a2-fancontrol@proxforge.invalid>
+Installed-Size: @SIZE@
+Section: admin
+Priority: optional
+Depends: python3, systemd
+Homepage: https://github.com/proxforge/ms-a2-fancontrol
+Description: Fan control for Minisforum MS-A2 by NVMe and RAM temperature
+ Raises the fan curves in the embedded controller (ITE IT5571) of the
+ Minisforum MS-A2 only as far as NVMe and RAM temperatures require, never
+ below the firmware levels. Needs Secure Boot disabled (access to the EC
+ I/O ports).
