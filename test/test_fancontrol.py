@@ -262,6 +262,16 @@ class DumpTest(unittest.TestCase):
         self.assertIn("30:  -- 00", text)
         self.assertIn("not readable", text)
 
+    def test_unsupported_exits_with_status_3(self):
+        for command, dmi in (("run", make_dmi(bios="1.03")), ("status", make_dmi(bios="1.03")),
+                             ("restore", make_dmi(bios="1.03")), ("stop-post", make_dmi(bios="1.03")),
+                             ("dump", make_dmi(product="Other"))):
+            ec = FakeEC()
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(fc.main(["ms-a2-fancontrol", command], lambda: ec, dmi), fc.EXIT_UNSUPPORTED)
+            self.assertIn("nothing written", err.getvalue())
+            self.assertEqual(ec.writes, [])
+
     def test_dump_needs_ms_a2(self):
         fc.check_product(make_dmi(bios="9.99"))
         with self.assertRaises(RuntimeError):

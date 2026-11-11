@@ -4,6 +4,11 @@ ms-a2-fancontrol (0.4.0) trixie; urgency=medium
     EC RAM 0x00-0xff, fan curve values and fan speeds. Runs on any MS-A2
     BIOS version and never writes to the EC, for adding support for
     other firmware.
+  * Unknown device, BIOS version or EC values: exit status 3 with a short
+    message instead of a traceback; the unit no longer restarts the
+    service every 10 seconds (RestartPreventExitStatus=3).
+  * README: only two onboard M.2 NVMe drives tested; notes on other drive
+    setups (U.2/U.3, PCIe cards).
 
  -- ProxForge <ms-a2-fancontrol@proxforge.invalid>  Wed, 11 Nov 2026 22:00:00 +0100
 

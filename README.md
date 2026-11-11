@@ -37,10 +37,17 @@ With the service, the NVMe controller stayed at 77 °C or below under the same l
 |---|---|
 | Device | Minisforum MS-A2 |
 | BIOS | 1.02. The service refuses other versions. |
-| Tested with | Ryzen 9 7945HX, 2× Micron 7450 NVMe, 2× 64 GB DDR5 SO-DIMM; five units |
+| Tested with | Ryzen 9 7945HX, 2× Micron 7450 NVMe in the onboard M.2 slots, 2× 64 GB DDR5 SO-DIMM; five units |
 | OS | Proxmox VE 9 (Debian 13 "trixie"). Any Debian-based system with systemd, Python 3 and a recent kernel should work. |
 
 At startup the service compares the product name, the BIOS version and the fan curve values in the EC with known values. If anything differs, it exits without writing. Other CPU variants of the MS-A2 (e.g. Ryzen 9 9955HX) are untested. They work only if their firmware matches. If yours doesn't, see [Other BIOS versions and CPU variants](#other-bios-versions-and-cpu-variants).
+
+Only two NVMe drives in the onboard M.2 slots have been tested. Other drive setups, such as a third M.2 drive, U.2/U.3 drives via adapter or NVMe drives on a PCIe card, are untested. The service uses **every** NVMe drive the kernel reports:
+
+- The hottest drive sets the system fan, even if that fan doesn't cool it (e.g. a drive on a PCIe card). The fan then speeds up without lowering that temperature, possibly up to the emergency level.
+- `NVME_SENSOR1_MAX` applies to the second temperature sensor (`temp2`) of every drive. On the Micron 7450 that is the controller. Other drives may report a different sensor there or none at all.
+
+With such setups, check the values in `ms-a2-fancontrol status` and adjust the thresholds in the [configuration](#configuration) if needed.
 
 ## Requirements
 
@@ -182,7 +189,7 @@ ms-a2-fancontrol restore
 | Message or symptom | Cause and fix |
 |---|---|
 | `PermissionError: [Errno 1] Operation not permitted: '/dev/port'` | Secure Boot is on (kernel lockdown). Disable Secure Boot in the BIOS. |
-| `unsupported system MS-A2 BIOS x.yz` | The BIOS version is not 1.02. The service only runs on firmware whose EC layout is known. See [Other BIOS versions and CPU variants](#other-bios-versions-and-cpu-variants). |
+| `unsupported system MS-A2 BIOS x.yz` | The BIOS version is not 1.02. The service only runs on firmware whose EC layout is known. It writes nothing, exits with status 3 and is not restarted, so the firmware curve stays active. See [Other BIOS versions and CPU variants](#other-bios-versions-and-cpu-variants). |
 | `unexpected EC profile byte at 0x2f` or `EC level 0x.. = .., expected ..` | The BIOS fan mode is not "Auto", or the firmware uses a different layout. Set the fan mode to "Auto". If the message persists, open an issue with the output of `ms-a2-fancontrol dump`. |
 | `no NVMe or DIMM temperature found` and fans at full speed | A temperature sensor is missing. The service runs the fans at the emergency level until it can read temperatures again. Check `grep -h . /sys/class/hwmon/hwmon*/name` and load the missing module, e.g. `modprobe spd5118`. |
 | Fans loud for a few minutes after a crash | Expected: after a crash or `kill` the service restarts and slows down from full speed one level every 5 seconds. A regular restart or package update starts from the firmware levels. |

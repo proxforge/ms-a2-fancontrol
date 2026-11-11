@@ -10,6 +10,8 @@ ExecStart=/usr/sbin/ms-a2-fancontrol run
 ExecStopPost=-/usr/sbin/ms-a2-fancontrol stop-post
 Restart=on-failure
 RestartSec=10
+# Unknown device or firmware (exit 3): nothing was written, restarting would only repeat the check
+RestartPreventExitStatus=3
 
 [Install]
 WantedBy=multi-user.target

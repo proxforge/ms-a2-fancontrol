@@ -282,6 +282,14 @@ def restore(ec):
 
 # --- Checks ------------------------------------------------------------------------------------
 
+# Exit status for unknown hardware or firmware; the unit does not restart on it (RestartPreventExitStatus)
+EXIT_UNSUPPORTED = 3
+
+
+class Unsupported(RuntimeError):
+    """Device, firmware or EC values unknown: nothing is written, a restart would not help."""
+
+
 def read_dmi(name, dmi_root=DMI_ROOT):
     with open(os.path.join(dmi_root, name)) as fh:
         return fh.read().strip()
@@ -291,20 +299,20 @@ def check_product(dmi_root=DMI_ROOT):
     """Only the device, any BIOS version: enough for read-only EC access ("dump")."""
     product = read_dmi("product_name", dmi_root)
     if product not in SUPPORTED_PRODUCTS:
-        raise RuntimeError("unsupported system %s" % product)
+        raise Unsupported("unsupported system %s" % product)
 
 
 def check_platform(ec, dmi_root=DMI_ROOT):
     product, bios = read_dmi("product_name", dmi_root), read_dmi("bios_version", dmi_root)
     if product not in SUPPORTED_PRODUCTS or bios not in SUPPORTED_BIOS:
-        raise RuntimeError("unsupported system %s BIOS %s" % (product, bios))
+        raise Unsupported("unsupported system %s BIOS %s" % (product, bios))
     if ec.read(EC_PROFILE_ADDR) not in EC_PROFILES:
-        raise RuntimeError("unexpected EC profile byte at 0x2f")
+        raise Unsupported("unexpected EC profile byte at 0x2f")
     for addr, default in zip(SYS_LEVEL_ADDRS + CPU_LEVEL_ADDRS, SYS_LEVEL_DEFAULTS + CPU_LEVEL_DEFAULTS):
         value = ec.read(addr)
         # Above firmware is allowed (left over from an earlier run), below or implausible is not
         if not default <= value <= 60:
-            raise RuntimeError("EC level 0x%02x = %d, expected %d..60" % (addr, value, default))
+            raise Unsupported("EC level 0x%02x = %d, expected %d..60" % (addr, value, default))
 
 
 # --- Commands ----------------------------------------------------------------------------------
@@ -458,19 +466,25 @@ def dump(ec, dmi_root=DMI_ROOT, hwmon_root=HWMON_ROOT, cpuinfo="/proc/cpuinfo"):
         print("fan speed           not readable (%s)" % err_text)
 
 
-def main(argv):
+def main(argv, open_ec=None, dmi_root=DMI_ROOT):
     if len(argv) != 2 or argv[1] not in ("run", "status", "restore", "stop-post", "dump", "version"):
         print(__doc__.strip().splitlines()[-1], file=sys.stderr)
         return 2
     if argv[1] == "version":
         print(VERSION)
         return 0
-    if argv[1] == "dump":
-        check_product()
-        dump(PortEC())
-        return 0
-    ec = PortEC()
-    check_platform(ec)
+    open_ec = open_ec or PortEC
+    try:
+        if argv[1] == "dump":
+            check_product(dmi_root)
+            dump(open_ec(), dmi_root)
+            return 0
+        ec = open_ec()
+        check_platform(ec, dmi_root)
+    except Unsupported as err:
+        print("ms-a2-fancontrol: %s; nothing written. See README, \"Other BIOS versions and CPU variants\"."
+              % err, file=sys.stderr)
+        return EXIT_UNSUPPORTED
     if argv[1] == "status":
         status(ec)
     elif argv[1] == "restore":
