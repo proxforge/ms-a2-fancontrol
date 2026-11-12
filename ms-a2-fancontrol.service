@@ -1,5 +1,5 @@
 [Unit]
-Description=Fan control for Minisforum MS-A2 by NVMe and RAM temperature
+Description=Fan control for Minisforum MS-A2 by NVMe, RAM and CPU temperature
 Documentation=https://github.com/proxforge/ms-a2-fancontrol
 After=systemd-modules-load.service
 

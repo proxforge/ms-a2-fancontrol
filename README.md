@@ -7,7 +7,7 @@ The stock fan curve of the MS-A2 only follows the CPU temperature. Under sustain
 `ms-a2-fancontrol` is a small systemd service that drives the fans by the temperatures that matter:
 
 - **System fan**: speeds up with the **NVMe temperature**.
-- **CPU fan**: speeds up with the **RAM temperature** (the RAM sits in its airflow). It still follows the firmware's CPU curve.
+- **CPU fan**: speeds up with the **RAM temperature** (the RAM sits in its airflow) or the **CPU temperature**, whichever needs more. It still follows the firmware's CPU curve.
 - Fans never spin **slower than the firmware curve**, and only as fast as needed.
 - **Emergency level**: both fans go to full speed when a component gets hot, when temperatures can't be read, or when the service crashes.
 
@@ -73,7 +73,7 @@ Install the package on every MS-A2 host, for example on each node of a Proxmox V
 Download `ms-a2-fancontrol_<version>_all.deb` from the [Releases](https://github.com/proxforge/ms-a2-fancontrol/releases) page and install it:
 
 ```bash
-apt install ./ms-a2-fancontrol_0.4.0_all.deb
+apt install ./ms-a2-fancontrol_0.5.0_all.deb
 ```
 
 ### From source
@@ -85,7 +85,7 @@ git clone https://github.com/proxforge/ms-a2-fancontrol.git
 cd ms-a2-fancontrol
 bash test/run-tests.sh
 ./build-deb.sh
-apt install ./ms-a2-fancontrol_0.4.0_all.deb
+apt install ./ms-a2-fancontrol_0.5.0_all.deb
 ```
 
 The package enables and starts the service immediately (`ms-a2-fancontrol.service`). It also starts automatically at every boot.
@@ -102,10 +102,14 @@ System fan levels [32, 36, 36] (firmware [26, 36, 36])
 CPU fan levels    [16, 16, 22, 26, 30, 33, 35] (firmware [16, 16, 22, 26, 30, 33, 35])
 EC temperatures   cpu 50 C, system 34 C
 Fan speed         cpu 1512 rpm, system 3199 rpm
+Service           cpu fan floor 16 (wanted 16, set by firmware), system fan floor 32 (wanted 32)
+Emergencies       0 since start 2 h 14 min ago
 ```
 
 - **Fan levels** are target speeds in units of 100 rpm, so level 32 means about 3200 rpm. The first value of each curve is the one the service raises. Values in brackets are the firmware defaults.
 - **Sensor 1** is the NVMe controller sensor, which runs hotter than the Composite value.
+- **Service** shows the levels the service set and what set the CPU fan: `ram`, `cpu`, `emergency`, or `firmware` (nothing is warm). While the fans slow down, the floor is above the wanted level.
+- **Emergencies** counts how often the emergency level was set since the service started. A count that keeps rising means a threshold is too low or a curve too weak; the journal has the details.
 
 Watch what the service does:
 
@@ -117,7 +121,9 @@ journalctl -u ms-a2-fancontrol -f
 It logs a line whenever it changes a level, for example:
 
 ```text
-nvme 61/71 C dimm 47 C cpu 66 C -> system fan level 49, cpu fan floor 16
+nvme 61/71 C dimm 47 C cpu 86 C -> system fan level 49, cpu fan floor 36 (cpu)
+emergency #1: cpu 95 C
+emergency over: all sensors at least 5 C below their thresholds
 ```
 
 ## Configuration
@@ -136,13 +142,16 @@ systemctl restart ms-a2-fancontrol
 | `SYS_LEVEL_MAX` | 50 | Highest regular level of the system fan (about 5000 rpm) |
 | `DIMM_LOW` | 50 | RAM temperature (°C) at which the CPU fan starts to speed up |
 | `DIMM_HIGH` | 62 | RAM temperature (°C) at which the CPU fan reaches `CPU_LEVEL_MAX` |
-| `CPU_LEVEL_MAX` | 40 | Highest regular minimum level of the CPU fan |
+| `CPU_LOW` | 80 | CPU Tctl (°C) at which the CPU fan starts to speed up |
+| `CPU_HIGH` | 90 | CPU Tctl (°C) at which the CPU fan reaches `CPU_LEVEL_MAX` |
+| `CPU_LEVEL_MAX` | 50 | Highest regular minimum level of the CPU fan (about 5000 rpm), for both the RAM and the CPU curve |
 | `FALL_STEP` | 1 | Levels the fans slow down per interval. Speeding up is immediate. |
 | `NVME_EMERGENCY` | 70 | NVMe Composite (°C) that triggers the emergency level. The drives warn at 77 °C. |
 | `NVME_SENSOR1_MAX` | 85 | NVMe controller sensor (°C) that triggers the emergency level |
 | `DIMM_EMERGENCY` | 68 | RAM temperature (°C) that triggers the emergency level. DDR5 modules are specified up to 85 °C. |
-| `CPU_EMERGENCY` | 92 | CPU Tctl (°C) that triggers the emergency level |
+| `CPU_EMERGENCY` | 95 | CPU Tctl (°C) that triggers the emergency level. The Ryzen 9 7945HX boosts up to its limit of 100 °C, so values around 90 °C are normal under load. |
 | `EMERGENCY_LEVEL` | 60 | Emergency level for both fans. 60 is full speed: about 6000 rpm on the CPU fan and 5200 rpm on the system fan. |
+| `EMERGENCY_HYST` | 5 | The emergency level ends only when every sensor is this many °C below its threshold. The fans then slow down to the regular curves. |
 
 The service refuses implausible settings and exits with an error in the journal. Examples are `LOW` not below `HIGH`, levels above 60, or an emergency threshold not above `HIGH`.
 
@@ -151,8 +160,10 @@ The service refuses implausible settings and exits with an error in the journal.
 | Fan | Cools | Input | Level |
 |---|---|---|---|
 | System fan | NVMe | hottest NVMe Composite | Firmware level 26 up to `NVME_LOW`, then linear up to `SYS_LEVEL_MAX` at `NVME_HIGH` |
-| CPU fan | RAM (and CPU) | hottest DDR5 SPD sensor | Firmware curve with a minimum level of 16 up to `DIMM_LOW`, then linear up to `CPU_LEVEL_MAX` at `DIMM_HIGH`. The firmware keeps raising the CPU fan with CPU temperature on top of that. |
-| both | Emergency | any emergency threshold, or no temperatures readable | `EMERGENCY_LEVEL` (full speed) |
+| CPU fan | CPU and RAM | hottest DDR5 SPD sensor and CPU Tctl | The higher of two ramps: firmware level 16 up to `DIMM_LOW`, then linear up to `CPU_LEVEL_MAX` at `DIMM_HIGH`; and the same from `CPU_LOW` to `CPU_HIGH` for the CPU. The firmware curve (levels 16–35 by CPU temperature) stays the lower limit. |
+| both | Emergency | any emergency threshold, or no temperatures readable | `EMERGENCY_LEVEL` (full speed) until every sensor is `EMERGENCY_HYST` below its threshold |
+
+Without the CPU ramp (up to version 0.4.0), the CPU temperature only triggered the emergency level. On a Ryzen 9 7945HX under constant light load this produced a sawtooth: the CPU reached 92 °C, both fans went to full speed, the CPU cooled to about 80 °C within seconds, the fans slowed back to level 16 within about 3.5 minutes, and the cycle repeated every 3 to 7 minutes. The CPU ramp holds the CPU fan at a steady, higher level instead.
 
 - The EC drives each fan to a target speed from its fan curve and adjusts the PWM signal itself. The service only raises the **speed levels of these curves**. It never writes temperature thresholds, PWM registers or EC commands.
 - Every write is read back and verified. A mismatch stops the service, and the emergency level applies.
@@ -167,6 +178,8 @@ What happens when the service stops:
 | Boot | The firmware curve applies until the service starts, a few seconds after the kernel modules load. |
 
 So the fans never fall back to the quiet firmware curve unnoticed after a failure.
+
+The service writes its state (levels, what set them, emergency count) to `/run/ms-a2-fancontrol.state` every interval for `ms-a2-fancontrol status`, and removes it on a regular stop.
 
 All EC accesses hold the lock `/run/ms-a2-fancontrol.lock`. Concurrent accesses to the EC ports would otherwise mix up their command sequences. Stop the service before using other tools that access the EC.
 

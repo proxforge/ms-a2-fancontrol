@@ -15,7 +15,11 @@
 # CPU fan by RAM (SPD sensor): raise from DIMM_LOW, full level at DIMM_HIGH
 #DIMM_LOW=50
 #DIMM_HIGH=62
-#CPU_LEVEL_MAX=40
+# CPU fan by CPU Tctl: raise from CPU_LOW, full level at CPU_HIGH.
+# The CPU fan runs at the higher of the RAM and the CPU value.
+#CPU_LOW=80
+#CPU_HIGH=90
+#CPU_LEVEL_MAX=50
 
 # Lower by at most this many levels per interval (raising is immediate)
 #FALL_STEP=1
@@ -24,5 +28,7 @@
 # EMERGENCY_LEVEL, i.e. full speed; the same applies when no temperatures can be read
 #NVME_EMERGENCY=70
 #DIMM_EMERGENCY=68
-#CPU_EMERGENCY=92
+#CPU_EMERGENCY=95
 #EMERGENCY_LEVEL=60
+# The emergency level ends only when every sensor is this many °C below its threshold
+#EMERGENCY_HYST=5

@@ -1,3 +1,22 @@
+ms-a2-fancontrol (0.5.0) trixie; urgency=medium
+
+  * CPU fan curve: the CPU fan also follows the CPU temperature (Tctl),
+    linear from CPU_LOW 80 °C to CPU_HIGH 90 °C. It runs at the higher of
+    the RAM and the CPU value. Before, the CPU temperature only triggered
+    the emergency level, which caused a sawtooth on a Ryzen 9 7945HX:
+    full speed at 92 °C, slow fall back to level 16, again 92 °C a few
+    minutes later (52 emergencies in 2.5 hours under nested PVE load).
+  * CPU_LEVEL_MAX raised from 40 to 50 (also the top of the RAM curve).
+  * CPU_EMERGENCY raised from 92 to 95 °C.
+  * Emergency hysteresis: the emergency level stays until every sensor
+    is EMERGENCY_HYST (5) °C below its threshold.
+  * "status" shows what set the CPU fan level (ram, cpu, emergency or
+    firmware) and the number of emergencies since the service started,
+    from the state file /run/ms-a2-fancontrol.state. The journal logs
+    the start and end of each emergency.
+
+ -- ProxForge <ms-a2-fancontrol@proxforge.invalid>  Thu, 12 Nov 2026 12:00:00 +0100
+
 ms-a2-fancontrol (0.4.0) trixie; urgency=medium
 
   * New command "dump": read-only report of DMI data, CPU model, sensors,

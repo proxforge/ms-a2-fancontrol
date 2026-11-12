@@ -1,11 +1,11 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Demand-based fan control for the Minisforum MS-A2 (EC ITE IT5571) by NVMe and RAM temperature.
+"""Demand-based fan control for the Minisforum MS-A2 (EC ITE IT5571) by NVMe, RAM and CPU temperature.
 
 The EC drives both fans to target speeds (level x 100 rpm) taken from fan curves in EC RAM.
 This service only raises the levels of those curves, never below the firmware values:
   - system fan (cools the NVMe drives): levels at 0x30, 0x33, 0x36
-  - CPU fan (airflow across the RAM): levels at 0x13, 0x16, ..., 0x25
+  - CPU fan (CPU, and airflow across the RAM): levels at 0x13, 0x16, ..., 0x25
 Regular stop (systemctl stop, apt remove, shutdown): firmware values are restored. Crash or
 error: emergency level (full speed) until systemd restarts the service; ExecStopPost calls
 "stop-post", which evaluates SERVICE_RESULT from systemd. Access through the ACPI EC ports
@@ -18,18 +18,21 @@ other firmware. It runs on any MS-A2 BIOS version and never writes to the EC.
 Usage: ms-a2-fancontrol run | status | restore | stop-post | dump | version
 """
 import contextlib
+import json
 import os
 import signal
 import sys
 import time
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 CONFIG_FILE = os.environ.get("MSA2_FAN_CONFIG", "/etc/default/ms-a2-fancontrol")
 HWMON_ROOT = os.environ.get("MSA2_FAN_HWMON", "/sys/class/hwmon")
 DMI_ROOT = os.environ.get("MSA2_FAN_DMI", "/sys/class/dmi/id")
 # The service and "status" share the EC ports; without a lock their command sequences interleave
 LOCK_FILE = os.environ.get("MSA2_FAN_LOCK", "/run/ms-a2-fancontrol.lock")
+# Written by the service every interval, read by "status": what set the levels, emergency count
+STATE_FILE = os.environ.get("MSA2_FAN_STATE", "/run/ms-a2-fancontrol.state")
 
 # Firmware levels (BIOS 1.02, fan mode Auto), read from five MS-A2 units
 SYS_LEVEL_ADDRS = (0x30, 0x33, 0x36)
@@ -51,15 +54,20 @@ DEFAULTS = {
     # CPU fan by RAM (SPD sensor): raise from DIMM_LOW, full level at DIMM_HIGH
     "DIMM_LOW": 50,
     "DIMM_HIGH": 62,
+    # CPU fan by CPU Tctl: raise from CPU_LOW, full level at CPU_HIGH; the higher of RAM and CPU wins
+    "CPU_LOW": 80,
+    "CPU_HIGH": 90,
     "SYS_LEVEL_MAX": 50,
-    "CPU_LEVEL_MAX": 40,
+    "CPU_LEVEL_MAX": 50,
     # Lower by at most this many levels per interval (raising is immediate)
     "FALL_STEP": 1,
     # Emergency: at any of these temperatures both fans go to EMERGENCY_LEVEL (full PWM)
     "NVME_EMERGENCY": 70,
     "DIMM_EMERGENCY": 68,
-    "CPU_EMERGENCY": 92,
+    "CPU_EMERGENCY": 95,
     "EMERGENCY_LEVEL": 60,
+    # Emergency ends only when every sensor is this many degrees below its threshold
+    "EMERGENCY_HYST": 5,
 }
 
 
@@ -80,7 +88,8 @@ def load_config(path=CONFIG_FILE):
                     cfg[key] = int(value.strip('"'))
     except FileNotFoundError:
         pass
-    if not (cfg["NVME_LOW"] < cfg["NVME_HIGH"] and cfg["DIMM_LOW"] < cfg["DIMM_HIGH"]):
+    if not (cfg["NVME_LOW"] < cfg["NVME_HIGH"] and cfg["DIMM_LOW"] < cfg["DIMM_HIGH"]
+            and cfg["CPU_LOW"] < cfg["CPU_HIGH"]):
         raise ValueError("LOW must be below HIGH")
     if cfg["SYS_LEVEL_MAX"] < max(SYS_LEVEL_DEFAULTS) or cfg["CPU_LEVEL_MAX"] < max(CPU_LEVEL_DEFAULTS):
         raise ValueError("LEVEL_MAX below firmware levels")
@@ -88,8 +97,11 @@ def load_config(path=CONFIG_FILE):
         raise ValueError("LEVEL_MAX above 60")
     if not max(cfg["SYS_LEVEL_MAX"], cfg["CPU_LEVEL_MAX"]) <= cfg["EMERGENCY_LEVEL"] <= 60:
         raise ValueError("EMERGENCY_LEVEL must be between LEVEL_MAX and 60")
-    if not (cfg["NVME_HIGH"] < cfg["NVME_EMERGENCY"] and cfg["DIMM_HIGH"] < cfg["DIMM_EMERGENCY"]):
+    if not (cfg["NVME_HIGH"] < cfg["NVME_EMERGENCY"] and cfg["DIMM_HIGH"] < cfg["DIMM_EMERGENCY"]
+            and cfg["CPU_HIGH"] < cfg["CPU_EMERGENCY"]):
         raise ValueError("EMERGENCY must be above HIGH")
+    if not 0 <= cfg["EMERGENCY_HYST"] <= 20:
+        raise ValueError("EMERGENCY_HYST must be between 0 and 20")
     return cfg
 
 
@@ -121,7 +133,7 @@ def read_temps(root=HWMON_ROOT):
             cpu.append(_read_milli(os.path.join(base, "temp1_input")))
     if not nvme or not dimm:
         raise OSError("no NVMe or DIMM temperature found")
-    # Without k10temp the EC still controls the CPU fan itself; the emergency level then only uses NVMe and RAM
+    # Without k10temp the EC still controls the CPU fan itself; the service then only uses NVMe and RAM
     return {"nvme": max(nvme), "nvme_s1": max(nvme_s1) if nvme_s1 else 0.0, "dimm": max(dimm),
             "cpu": max(cpu) if cpu else 0.0}
 
@@ -137,21 +149,35 @@ def ramp(value, low, high, level_min, level_max):
     return round(level_min + (value - low) * (level_max - level_min) / (high - low))
 
 
-def emergency(temps, cfg):
-    """Emergency level: no temperatures or any emergency threshold reached."""
+EMERGENCY_SENSORS = (("nvme", "NVME_EMERGENCY"), ("nvme_s1", "NVME_SENSOR1_MAX"), ("dimm", "DIMM_EMERGENCY"),
+                     ("cpu", "CPU_EMERGENCY"))
+
+
+def emergency_reasons(temps, cfg, active=False):
+    """Sensors at or above their emergency threshold; while active, the thresholds are EMERGENCY_HYST lower."""
     if temps is None:
-        return True
-    return (temps["nvme"] >= cfg["NVME_EMERGENCY"] or temps["nvme_s1"] >= cfg["NVME_SENSOR1_MAX"]
-            or temps["dimm"] >= cfg["DIMM_EMERGENCY"] or temps["cpu"] >= cfg["CPU_EMERGENCY"])
+        return ["no temperatures"]
+    margin = cfg["EMERGENCY_HYST"] if active else 0
+    return ["%s %.0f C" % (key, temps[key]) for key, limit in EMERGENCY_SENSORS
+            if temps[key] >= cfg[limit] - margin]
 
 
-def demand(temps, cfg):
-    """Requested minimum level for the system fan and the CPU fan."""
-    if emergency(temps, cfg):
-        return cfg["EMERGENCY_LEVEL"], cfg["EMERGENCY_LEVEL"]
+def emergency(temps, cfg, active=False):
+    """Emergency level: no temperatures or any emergency threshold reached (with hysteresis while active)."""
+    return bool(emergency_reasons(temps, cfg, active))
+
+
+def demand(temps, cfg, active=False):
+    """Requested minimum level for the system fan and the CPU fan, and what set the CPU fan level:
+    "emergency", "cpu", "ram" or "firmware". active: the emergency level is already set (hysteresis)."""
+    if emergency(temps, cfg, active):
+        return cfg["EMERGENCY_LEVEL"], cfg["EMERGENCY_LEVEL"], "emergency"
     sys_level = ramp(temps["nvme"], cfg["NVME_LOW"], cfg["NVME_HIGH"], SYS_LEVEL_DEFAULTS[0], cfg["SYS_LEVEL_MAX"])
-    cpu_level = ramp(temps["dimm"], cfg["DIMM_LOW"], cfg["DIMM_HIGH"], CPU_LEVEL_DEFAULTS[0], cfg["CPU_LEVEL_MAX"])
-    return sys_level, cpu_level
+    by_ram = ramp(temps["dimm"], cfg["DIMM_LOW"], cfg["DIMM_HIGH"], CPU_LEVEL_DEFAULTS[0], cfg["CPU_LEVEL_MAX"])
+    by_cpu = ramp(temps["cpu"], cfg["CPU_LOW"], cfg["CPU_HIGH"], CPU_LEVEL_DEFAULTS[0], cfg["CPU_LEVEL_MAX"])
+    if by_cpu > by_ram:
+        return sys_level, by_cpu, "cpu"
+    return sys_level, by_ram, "ram" if by_ram > CPU_LEVEL_DEFAULTS[0] else "firmware"
 
 
 def smooth(previous, wanted, fall_step):
@@ -317,6 +343,22 @@ def check_platform(ec, dmi_root=DMI_ROOT):
 
 # --- Commands ----------------------------------------------------------------------------------
 
+def write_state(state, path=None):
+    """State for "status"; errors are ignored, the file is only informational."""
+    path = path or STATE_FILE
+    try:
+        with open(path + ".tmp", "w") as fh:
+            json.dump(state, fh)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
+def remove_state(path=None):
+    with contextlib.suppress(OSError):
+        os.remove(path or STATE_FILE)
+
+
 def run(ec, cfg, sleep=time.sleep, cycles=None):
     stop = {"flag": False}
 
@@ -328,6 +370,7 @@ def run(ec, cfg, sleep=time.sleep, cycles=None):
     # Start from the levels in the EC: after a crash (emergency level) lower slowly instead of jumping
     sys_level, cpu_level = ec.read(SYS_LEVEL_ADDRS[0]), ec.read(CPU_LEVEL_ADDRS[0])
     log("ms-a2-fancontrol %s: start" % VERSION)
+    state = {"start": time.time(), "emergencies": 0, "last_emergency": None, "emergency": False}
     try:
         n = 0
         while not stop["flag"] and (cycles is None or n < cycles):
@@ -337,21 +380,32 @@ def run(ec, cfg, sleep=time.sleep, cycles=None):
             except (OSError, ValueError) as err:
                 log("temperature read failed (%s): emergency fan levels" % err)
                 temps = None
-            want_sys, want_cpu = demand(temps, cfg)
+            was_emergency = state["emergency"]
+            want_sys, want_cpu, source = demand(temps, cfg, was_emergency)
+            state["emergency"] = source == "emergency"
+            if state["emergency"] and not was_emergency:
+                state["emergencies"] += 1
+                state["last_emergency"] = time.time()
+                log("emergency #%d: %s" % (state["emergencies"], ", ".join(emergency_reasons(temps, cfg))))
+            elif was_emergency and not state["emergency"]:
+                log("emergency over: all sensors at least %d C below their thresholds" % cfg["EMERGENCY_HYST"])
             new_sys = smooth(sys_level, want_sys, cfg["FALL_STEP"])
             new_cpu = smooth(cpu_level, want_cpu, cfg["FALL_STEP"])
             if apply_levels(ec, new_sys, new_cpu) or (new_sys, new_cpu) != (sys_level, cpu_level):
                 if temps:
-                    log("nvme %.0f/%.0f C dimm %.0f C cpu %.0f C -> system fan level %d, cpu fan floor %d%s"
-                        % (temps["nvme"], temps["nvme_s1"], temps["dimm"], temps["cpu"], new_sys, new_cpu,
-                           " (emergency)" if emergency(temps, cfg) else ""))
+                    log("nvme %.0f/%.0f C dimm %.0f C cpu %.0f C -> system fan level %d, cpu fan floor %d (%s)"
+                        % (temps["nvme"], temps["nvme_s1"], temps["dimm"], temps["cpu"], new_sys, new_cpu, source))
             sys_level, cpu_level = new_sys, new_cpu
+            state.update(time=time.time(), sys_level=sys_level, cpu_level=cpu_level, want_sys=want_sys,
+                         want_cpu=want_cpu, source=source)
+            write_state(state)
             sleep(cfg["INTERVAL"])
     except BaseException:
         set_emergency(ec, cfg)
         raise
     restore(ec)
-    log("ms-a2-fancontrol: firmware fan levels restored")
+    remove_state()
+    log("ms-a2-fancontrol: firmware fan levels restored (%d emergencies since start)" % state["emergencies"])
 
 
 def set_emergency(ec, cfg):
@@ -373,7 +427,30 @@ def stop_post(ec, cfg, service_result):
     set_emergency(ec, cfg)
 
 
-def status(ec):
+def _duration(seconds):
+    minutes = int(seconds) // 60
+    if minutes < 60:
+        return "%d min" % minutes
+    return "%d h %02d min" % (minutes // 60, minutes % 60)
+
+
+def describe_state(state, now=None):
+    """Lines for "status" from the state file of the running service."""
+    now = now or time.time()
+    lines = ["Service           cpu fan floor %d (wanted %d, set by %s), system fan floor %d (wanted %d)"
+             % (state["cpu_level"], state["want_cpu"], state["source"], state["sys_level"], state["want_sys"])]
+    text = "Emergencies       %d since start %s ago" % (state["emergencies"], _duration(now - state["start"]))
+    if state["last_emergency"]:
+        text += ", last %s ago" % _duration(now - state["last_emergency"])
+    if state["emergency"]:
+        text += ", ACTIVE"
+    lines.append(text)
+    if now - state["time"] > 60:
+        lines.append("State file is %s old: the service is not running" % _duration(now - state["time"]))
+    return lines
+
+
+def status(ec, state_file=None):
     temps = read_temps()
     rpm = ec.tach_rpm()
     print("NVMe Composite %.0f C, Sensor 1 %.0f C, DIMM %.0f C, CPU %.0f C"
@@ -383,6 +460,13 @@ def status(ec):
     print("EC temperatures   cpu %d C, system %d C" % (ec.read(0x09), ec.read(0x05)))
     if rpm:
         print("Fan speed         cpu %d rpm, system %d rpm" % rpm)
+    try:
+        with open(state_file or STATE_FILE) as fh:
+            lines = describe_state(json.load(fh))
+    except (OSError, ValueError, KeyError, TypeError):
+        lines = ["Service           no state (service not running)"]
+    for line in lines:
+        print(line)
 
 
 DUMP_DMI = ("sys_vendor", "product_name", "board_name", "bios_vendor", "bios_version", "bios_date",

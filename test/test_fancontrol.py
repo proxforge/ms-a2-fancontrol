@@ -5,6 +5,7 @@ import contextlib
 import importlib.machinery
 import io
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -78,31 +79,49 @@ class ControlTest(unittest.TestCase):
     cfg = dict(fc.DEFAULTS)
 
     def test_cool_stays_at_firmware(self):
-        self.assertEqual(fc.demand({"nvme": 45, "nvme_s1": 60, "dimm": 40, "cpu": 60}, self.cfg), (26, 16))
+        self.assertEqual(fc.demand({"nvme": 45, "nvme_s1": 60, "dimm": 40, "cpu": 60}, self.cfg), (26, 16, "firmware"))
 
     def test_warm_nvme_raises_system_fan_linearly(self):
-        sys_level, cpu_level = fc.demand({"nvme": 56, "nvme_s1": 70, "dimm": 40, "cpu": 60}, self.cfg)
+        sys_level, cpu_level, _source = fc.demand({"nvme": 56, "nvme_s1": 70, "dimm": 40, "cpu": 60}, self.cfg)
         self.assertEqual(sys_level, 38)
         self.assertEqual(cpu_level, 16)
 
     def test_hot_nvme_full_level(self):
-        self.assertEqual(fc.demand({"nvme": 65, "nvme_s1": 78, "dimm": 40, "cpu": 60}, self.cfg), (50, 16))
+        self.assertEqual(fc.demand({"nvme": 65, "nvme_s1": 78, "dimm": 40, "cpu": 60}, self.cfg)[:2], (50, 16))
 
     def test_controller_sensor_forces_emergency(self):
-        self.assertEqual(fc.demand({"nvme": 51, "nvme_s1": 85, "dimm": 40, "cpu": 60}, self.cfg), (60, 60))
+        self.assertEqual(fc.demand({"nvme": 51, "nvme_s1": 85, "dimm": 40, "cpu": 60}, self.cfg), (60, 60, "emergency"))
 
     def test_emergency_per_sensor(self):
         base = {"nvme": 45, "nvme_s1": 60, "dimm": 40, "cpu": 60}
-        for key, value in (("nvme", 70), ("dimm", 68), ("cpu", 92)):
+        for key, value in (("nvme", 70), ("dimm", 68), ("cpu", 95)):
             temps = dict(base, **{key: value})
-            self.assertEqual(fc.demand(temps, self.cfg), (60, 60), key)
-        self.assertEqual(fc.demand(dict(base, dimm=67), self.cfg), (26, 40))
+            self.assertEqual(fc.demand(temps, self.cfg)[:2], (60, 60), key)
+        self.assertEqual(fc.demand(dict(base, dimm=67), self.cfg), (26, 50, "ram"))
 
     def test_warm_ram_raises_cpu_fan(self):
-        self.assertEqual(fc.demand({"nvme": 45, "nvme_s1": 60, "dimm": 62, "cpu": 60}, self.cfg), (26, 40))
+        self.assertEqual(fc.demand({"nvme": 45, "nvme_s1": 60, "dimm": 62, "cpu": 60}, self.cfg), (26, 50, "ram"))
 
     def test_no_temperatures_emergency(self):
-        self.assertEqual(fc.demand(None, self.cfg), (60, 60))
+        self.assertEqual(fc.demand(None, self.cfg), (60, 60, "emergency"))
+
+    def test_hot_cpu_raises_cpu_fan_linearly(self):
+        temps = {"nvme": 45, "nvme_s1": 60, "dimm": 40, "cpu": 85}
+        self.assertEqual(fc.demand(temps, self.cfg), (26, 33, "cpu"))
+        self.assertEqual(fc.demand(dict(temps, cpu=90), self.cfg), (26, 50, "cpu"))
+        self.assertEqual(fc.demand(dict(temps, cpu=80), self.cfg), (26, 16, "firmware"))
+
+    def test_higher_of_ram_and_cpu_wins(self):
+        temps = {"nvme": 45, "nvme_s1": 60, "dimm": 56, "cpu": 82}
+        self.assertEqual(fc.demand(temps, self.cfg), (26, 33, "ram"))
+        self.assertEqual(fc.demand(dict(temps, cpu=88), self.cfg), (26, 43, "cpu"))
+
+    def test_emergency_hysteresis(self):
+        temps = {"nvme": 45, "nvme_s1": 60, "dimm": 40, "cpu": 91}
+        self.assertEqual(fc.demand(temps, self.cfg)[2], "cpu")
+        self.assertEqual(fc.demand(temps, self.cfg, active=True)[2], "emergency")
+        self.assertEqual(fc.demand(dict(temps, cpu=89), self.cfg, active=True), (26, 47, "cpu"))
+        self.assertEqual(fc.emergency_reasons(dict(temps, cpu=96, dimm=69), self.cfg), ["dimm 69 C", "cpu 96 C"])
 
     def test_lower_slowly_raise_immediately(self):
         self.assertEqual(fc.smooth(40, 26, 1), 39)
@@ -282,9 +301,12 @@ class RunTest(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()
         self._old_root = fc.HWMON_ROOT
+        self._old_state = fc.STATE_FILE
+        fc.STATE_FILE = os.path.join(tempfile.mkdtemp(), "state")
 
     def tearDown(self):
         fc.HWMON_ROOT = self._old_root
+        fc.STATE_FILE = self._old_state
 
     def run_cycles(self, ec, cycles):
         # read_temps uses the parameter default; redirect it to the test directory
@@ -311,7 +333,7 @@ class RunTest(unittest.TestCase):
         self.assertIn((0x13, 60), ec.writes)
 
     def test_hot_cpu_emergency(self):
-        make_hwmon(self.root, nvme=[50, 50], nvme_s1=[65, 65], dimm=[45, 45], cpu=93)
+        make_hwmon(self.root, nvme=[50, 50], nvme_s1=[65, 65], dimm=[45, 45], cpu=96)
         ec = FakeEC()
         self.run_cycles(ec, 1)
         self.assertIn((0x30, 60), ec.writes)
@@ -321,7 +343,7 @@ class RunTest(unittest.TestCase):
         make_hwmon(self.root, nvme=[50, 50], nvme_s1=[65, 65], dimm=[45, 45])
         ec = FakeEC()
         original = fc.demand
-        fc.demand = lambda _temps, _cfg: (_ for _ in ()).throw(RuntimeError("test error"))
+        fc.demand = lambda *_args: (_ for _ in ()).throw(RuntimeError("test error"))
         try:
             with self.assertRaises(RuntimeError):
                 self.run_cycles(ec, 1)
@@ -339,9 +361,74 @@ class RunTest(unittest.TestCase):
         sys_writes = [value for addr, value in ec.writes if addr == 0x30]
         self.assertEqual(sys_writes[:2], [59, 58])
 
+    def test_cpu_sawtooth_is_gone(self):
+        """CPU at 95 C: emergency until it is below 90 C, then the CPU curve instead of firmware level 16."""
+        cpu_temps = iter([95, 93, 91, 89, 89, 89])
+        ec = FakeEC()
+        original = fc.read_temps
+        fc.read_temps = lambda: {"nvme": 45, "nvme_s1": 60, "dimm": 45, "cpu": next(cpu_temps)}
+        states = []
+        original_write = fc.write_state
+        fc.write_state = lambda state, path=None: states.append(dict(state))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                fc.run(ec, dict(fc.DEFAULTS), sleep=lambda _s: None, cycles=6)
+        finally:
+            fc.read_temps = original
+            fc.write_state = original_write
+        self.assertEqual([s["source"] for s in states], ["emergency"] * 3 + ["cpu"] * 3)
+        self.assertEqual([s["cpu_level"] for s in states], [60, 60, 60, 59, 58, 57])
+        self.assertEqual(states[-1]["want_cpu"], 47)
+        self.assertEqual(states[-1]["emergencies"], 1)
+        self.assertIn("emergency #1: cpu 95 C", out.getvalue())
+        self.assertIn("emergency over", out.getvalue())
+
+    def test_state_file_written_and_removed(self):
+        make_hwmon(self.root, nvme=[50, 50], nvme_s1=[65, 65], dimm=[45, 45], cpu=85)
+        seen = []
+        original_write = fc.write_state
+
+        def capture(state, path=None):
+            original_write(state, path)
+            with open(fc.STATE_FILE) as fh:
+                seen.append(json.load(fh))
+        fc.write_state = capture
+        try:
+            self.run_cycles(FakeEC(), 1)
+        finally:
+            fc.write_state = original_write
+        self.assertEqual((seen[0]["source"], seen[0]["cpu_level"]), ("cpu", 33))
+        self.assertFalse(os.path.exists(fc.STATE_FILE))
+
     def test_without_k10temp_cpu_zero(self):
         make_hwmon(self.root, nvme=[50, 50], nvme_s1=[65, 65], dimm=[45, 45])
         self.assertEqual(fc.read_temps(self.root)["cpu"], 0.0)
+
+
+class StatusTest(unittest.TestCase):
+    def test_status_shows_source_and_emergencies(self):
+        now = 1_000_000
+        state = {"start": now - 2 * 3600, "emergencies": 3, "last_emergency": now - 600, "emergency": False,
+                 "time": now - 5, "sys_level": 44, "cpu_level": 41, "want_sys": 44, "want_cpu": 40, "source": "cpu"}
+        self.assertEqual(fc.describe_state(state, now), [
+            "Service           cpu fan floor 41 (wanted 40, set by cpu), system fan floor 44 (wanted 44)",
+            "Emergencies       3 since start 2 h 00 min ago, last 10 min ago"])
+        state.update(emergency=True, time=now - 300)
+        lines = fc.describe_state(state, now)
+        self.assertTrue(lines[1].endswith(", ACTIVE"))
+        self.assertIn("not running", lines[2])
+
+    def test_status_without_service(self):
+        root = tempfile.mkdtemp()
+        make_hwmon(root, nvme=[50], nvme_s1=[65], dimm=[45], cpu=70)
+        original = fc.read_temps
+        fc.read_temps = lambda: original(root)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                fc.status(FakeEC(), os.path.join(root, "missing"))
+        finally:
+            fc.read_temps = original
+        self.assertIn("no state (service not running)", out.getvalue())
 
 
 class ConfigTest(unittest.TestCase):
@@ -360,7 +447,8 @@ class ConfigTest(unittest.TestCase):
 
     def test_implausible_values_are_rejected(self):
         for text in ("NVME_LOW=70\n", "SYS_LEVEL_MAX=20\n", "CPU_LEVEL_MAX=99\n", "EMERGENCY_LEVEL=45\n",
-                     "EMERGENCY_LEVEL=70\n", "DIMM_EMERGENCY=60\n"):
+                     "EMERGENCY_LEVEL=70\n", "DIMM_EMERGENCY=60\n", "CPU_LOW=90\n", "CPU_EMERGENCY=90\n",
+                     "EMERGENCY_HYST=-1\n"):
             with self.assertRaises(ValueError):
                 fc.load_config(self.write(text))
 
