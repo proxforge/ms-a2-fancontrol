@@ -128,6 +128,14 @@ class ControlTest(unittest.TestCase):
         self.assertEqual(fc.smooth(30, 45, 1), 45)
         self.assertEqual(fc.smooth(None, 26, 1), 26)
 
+    def test_fall_hysteresis_holds_level(self):
+        # hold reaches the current level: stay; below it: lower, but not below hold
+        self.assertEqual(fc.smooth(38, 36, 1, hold=38), 38)
+        self.assertEqual(fc.smooth(38, 34, 1, hold=36), 37)
+        self.assertEqual(fc.smooth(40, 30, 5, hold=37), 37)
+        temps = {"nvme": 55, "nvme_s1": 70, "dimm": 46, "cpu": 60}
+        self.assertEqual(fc.curve_levels(temps, self.cfg, 1), fc.curve_levels(dict(temps, nvme=56), self.cfg))
+
     def test_curve_never_below_firmware(self):
         self.assertEqual(fc.curve(30, fc.SYS_LEVEL_DEFAULTS), (30, 36, 36))
         self.assertEqual(fc.curve(0, fc.CPU_LEVEL_DEFAULTS), fc.CPU_LEVEL_DEFAULTS)
@@ -360,6 +368,22 @@ class RunTest(unittest.TestCase):
         self.run_cycles(ec, 2)
         sys_writes = [value for addr, value in ec.writes if addr == 0x30]
         self.assertEqual(sys_writes[:2], [59, 58])
+
+    def test_nvme_flicker_keeps_level(self):
+        """NVMe flickering between 55 and 56 C: the system fan stays at the level for 56 C."""
+        nvme = iter([56, 55, 55, 56, 55, 55, 54, 53])
+        original = fc.read_temps
+        fc.read_temps = lambda: {"nvme": next(nvme), "nvme_s1": 70, "dimm": 46, "cpu": 60}
+        states = []
+        original_write = fc.write_state
+        fc.write_state = lambda state, path=None: states.append(dict(state))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                fc.run(FakeEC(), dict(fc.DEFAULTS), sleep=lambda _s: None, cycles=8)
+        finally:
+            fc.read_temps = original
+            fc.write_state = original_write
+        self.assertEqual([s["sys_level"] for s in states], [38, 38, 38, 38, 38, 38, 37, 36])
 
     def test_cpu_sawtooth_is_gone(self):
         """CPU at 95 C: emergency until it is below 90 C, then the CPU curve instead of firmware level 16."""

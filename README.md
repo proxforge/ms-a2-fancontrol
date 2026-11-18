@@ -73,7 +73,7 @@ Install the package on every MS-A2 host, for example on each node of a Proxmox V
 Download `ms-a2-fancontrol_<version>_all.deb` from the [Releases](https://github.com/proxforge/ms-a2-fancontrol/releases) page and install it:
 
 ```bash
-apt install ./ms-a2-fancontrol_0.5.0_all.deb
+apt install ./ms-a2-fancontrol_0.6.0_all.deb
 ```
 
 ### From source
@@ -85,7 +85,7 @@ git clone https://github.com/proxforge/ms-a2-fancontrol.git
 cd ms-a2-fancontrol
 bash test/run-tests.sh
 ./build-deb.sh
-apt install ./ms-a2-fancontrol_0.5.0_all.deb
+apt install ./ms-a2-fancontrol_0.6.0_all.deb
 ```
 
 The package enables and starts the service immediately (`ms-a2-fancontrol.service`). It also starts automatically at every boot.
@@ -146,6 +146,7 @@ systemctl restart ms-a2-fancontrol
 | `CPU_HIGH` | 90 | CPU Tctl (°C) at which the CPU fan reaches `CPU_LEVEL_MAX` |
 | `CPU_LEVEL_MAX` | 50 | Highest regular minimum level of the CPU fan (about 5000 rpm), for both the RAM and the CPU curve |
 | `FALL_STEP` | 1 | Levels the fans slow down per interval. Speeding up is immediate. |
+| `FALL_HYST` | 1 | The fans slow down only when the temperature is this many °C below the value for the current level. Without it, a sensor flickering between two values (55/56 °C) moves the level up and down every few seconds. `0` turns it off. |
 | `NVME_EMERGENCY` | 70 | NVMe Composite (°C) that triggers the emergency level. The drives warn at 77 °C. |
 | `NVME_SENSOR1_MAX` | 85 | NVMe controller sensor (°C) that triggers the emergency level |
 | `DIMM_EMERGENCY` | 68 | RAM temperature (°C) that triggers the emergency level. DDR5 modules are specified up to 85 °C. |

@@ -24,7 +24,7 @@ import signal
 import sys
 import time
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 CONFIG_FILE = os.environ.get("MSA2_FAN_CONFIG", "/etc/default/ms-a2-fancontrol")
 HWMON_ROOT = os.environ.get("MSA2_FAN_HWMON", "/sys/class/hwmon")
@@ -61,6 +61,8 @@ DEFAULTS = {
     "CPU_LEVEL_MAX": 50,
     # Lower by at most this many levels per interval (raising is immediate)
     "FALL_STEP": 1,
+    # Lower only when the temperature is this many degrees below the value for the current level
+    "FALL_HYST": 1,
     # Emergency: at any of these temperatures both fans go to EMERGENCY_LEVEL (full PWM)
     "NVME_EMERGENCY": 70,
     "DIMM_EMERGENCY": 68,
@@ -102,6 +104,8 @@ def load_config(path=CONFIG_FILE):
         raise ValueError("EMERGENCY must be above HIGH")
     if not 0 <= cfg["EMERGENCY_HYST"] <= 20:
         raise ValueError("EMERGENCY_HYST must be between 0 and 20")
+    if not 0 <= cfg["FALL_HYST"] <= 10:
+        raise ValueError("FALL_HYST must be between 0 and 10")
     return cfg
 
 
@@ -172,19 +176,31 @@ def demand(temps, cfg, active=False):
     "emergency", "cpu", "ram" or "firmware". active: the emergency level is already set (hysteresis)."""
     if emergency(temps, cfg, active):
         return cfg["EMERGENCY_LEVEL"], cfg["EMERGENCY_LEVEL"], "emergency"
-    sys_level = ramp(temps["nvme"], cfg["NVME_LOW"], cfg["NVME_HIGH"], SYS_LEVEL_DEFAULTS[0], cfg["SYS_LEVEL_MAX"])
-    by_ram = ramp(temps["dimm"], cfg["DIMM_LOW"], cfg["DIMM_HIGH"], CPU_LEVEL_DEFAULTS[0], cfg["CPU_LEVEL_MAX"])
-    by_cpu = ramp(temps["cpu"], cfg["CPU_LOW"], cfg["CPU_HIGH"], CPU_LEVEL_DEFAULTS[0], cfg["CPU_LEVEL_MAX"])
+    return curve_levels(temps, cfg)
+
+
+def curve_levels(temps, cfg, offset=0):
+    """Levels of the regular curves (no emergency check), with every temperature raised by offset."""
+    sys_level = ramp(temps["nvme"] + offset, cfg["NVME_LOW"], cfg["NVME_HIGH"], SYS_LEVEL_DEFAULTS[0],
+                     cfg["SYS_LEVEL_MAX"])
+    by_ram = ramp(temps["dimm"] + offset, cfg["DIMM_LOW"], cfg["DIMM_HIGH"], CPU_LEVEL_DEFAULTS[0],
+                  cfg["CPU_LEVEL_MAX"])
+    by_cpu = ramp(temps["cpu"] + offset, cfg["CPU_LOW"], cfg["CPU_HIGH"], CPU_LEVEL_DEFAULTS[0], cfg["CPU_LEVEL_MAX"])
     if by_cpu > by_ram:
         return sys_level, by_cpu, "cpu"
     return sys_level, by_ram, "ram" if by_ram > CPU_LEVEL_DEFAULTS[0] else "firmware"
 
 
-def smooth(previous, wanted, fall_step):
-    """Raise immediately, lower slowly."""
+def smooth(previous, wanted, fall_step, hold=None):
+    """Raise immediately, lower slowly. hold: level at FALL_HYST degrees more; the level stays while
+    hold reaches it, so a sensor flickering by one degree does not move the fans up and down."""
     if previous is None or wanted >= previous:
         return wanted
-    return max(wanted, previous - fall_step)
+    if hold is None:
+        hold = wanted
+    if hold >= previous:
+        return previous
+    return max(wanted, hold, previous - fall_step)
 
 
 def curve(floor, defaults):
@@ -389,8 +405,11 @@ def run(ec, cfg, sleep=time.sleep, cycles=None):
                 log("emergency #%d: %s" % (state["emergencies"], ", ".join(emergency_reasons(temps, cfg))))
             elif was_emergency and not state["emergency"]:
                 log("emergency over: all sensors at least %d C below their thresholds" % cfg["EMERGENCY_HYST"])
-            new_sys = smooth(sys_level, want_sys, cfg["FALL_STEP"])
-            new_cpu = smooth(cpu_level, want_cpu, cfg["FALL_STEP"])
+            hold_sys = hold_cpu = None
+            if not state["emergency"]:
+                hold_sys, hold_cpu = curve_levels(temps, cfg, cfg["FALL_HYST"])[:2]
+            new_sys = smooth(sys_level, want_sys, cfg["FALL_STEP"], hold_sys)
+            new_cpu = smooth(cpu_level, want_cpu, cfg["FALL_STEP"], hold_cpu)
             if apply_levels(ec, new_sys, new_cpu) or (new_sys, new_cpu) != (sys_level, cpu_level):
                 if temps:
                     log("nvme %.0f/%.0f C dimm %.0f C cpu %.0f C -> system fan level %d, cpu fan floor %d (%s)"

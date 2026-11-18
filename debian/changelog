@@ -1,3 +1,14 @@
+ms-a2-fancontrol (0.6.0) trixie; urgency=medium
+
+  * Fall hysteresis FALL_HYST (default 1 °C): the fans slow down only when
+    the temperature is that far below the value for the current level.
+    An NVMe Composite flickering between 55 and 56 °C moved the system fan
+    in a sawtooth 38, 37, 36, 38 every 15 seconds, with an EC write and a
+    journal line each time (about 1000 lines in 4 hours). Now the level
+    stays at the value for 56 °C until the drive is at 54 °C.
+
+ -- ProxForge <ms-a2-fancontrol@proxforge.invalid>  Wed, 18 Nov 2026 12:00:00 +0100
+
 ms-a2-fancontrol (0.5.0) trixie; urgency=medium
 
   * CPU fan curve: the CPU fan also follows the CPU temperature (Tctl),

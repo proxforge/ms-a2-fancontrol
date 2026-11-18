@@ -23,6 +23,9 @@
 
 # Lower by at most this many levels per interval (raising is immediate)
 #FALL_STEP=1
+# Lower only when the temperature is this many °C below the value for the current level,
+# so a sensor flickering by one degree does not move the fans up and down
+#FALL_HYST=1
 
 # Emergency level: at any of these temperatures (NVMe Composite, RAM, CPU Tctl) both fans go to
 # EMERGENCY_LEVEL, i.e. full speed; the same applies when no temperatures can be read
